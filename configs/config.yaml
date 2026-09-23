@@ -1,0 +1,77 @@
+model:
+  vocab_size: 16000
+  max_seq_len: 256
+  hidden_dim: 512
+  num_heads: 8
+  encoder_layers: 4
+  decoder_layers: 8
+  ffn_dim: 2048
+  dropout: 0.1
+  num_semantic_tokens: 32
+  encoder_layer_split: null
+  decoder_sees_prompt: false
+  tie_embeddings: true
+bottleneck:
+  noise_std: 0.05
+  use_noise_train: true
+  use_queries: true
+core:
+  type: bihopfield
+  num_layers: 8
+  num_heads: 8
+  ffn_dim: 2048
+  dropout: 0.1
+  mlp_hidden: 2048
+  hopfield_beta: 1.0
+  hopfield_steps: 8
+  seed: 1234
+loss:
+  paraphrase_weight: 0.5
+  variance_weight: 1.0
+  covariance_weight: 1.0
+  variance_target: 1.0
+  latent_weight: 1.0
+  latent_cosine_weight: 0.5
+  decode_weight: 1.0
+data:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  cache_dir: data/cache
+  metadata_path: data/metadata.json
+  max_seq_len: 256
+  val_split: 0.04
+  test_split: 0.04
+  seed: 42
+  hf_dataset: roskoN/dailydialog
+  tokenizer_type: bpe
+  bpe_vocab_size: 16000
+train:
+  device: auto
+  batch_size: 32
+  lr: 0.0003
+  weight_decay: 0.01
+  epochs: 50
+  max_steps: null
+  warmup_steps: 500
+  grad_accum: 4
+  grad_clip: 1.0
+  val_interval: 1000
+  patience: null
+  amp: auto
+  num_workers: 0
+  seed: 3407
+  log_dir: logs
+  checkpoint_dir: checkpoints
+  samples_dir: samples
+  log_interval: 50
+  preview_prompts:
+  - 今天天气很好，我决定
+  - 小明拿起苹果，然后
+  - 人工智能最重要的问题之一是
+  - 如果一个物体从桌子上掉下来，那么
+  - 我喜欢音乐，因为
+gen:
+  max_gen_len: 2048
+  temperature: 0.7
+  top_p: 0.9
+  greedy: true
