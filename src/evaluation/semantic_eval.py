@@ -1,6 +1,5 @@
 """Latent-space semantics: the tests that decide whether the bottleneck
 really encodes MEANING (not surface form).
-
 - semantic_tests: paraphrase / different-meaning / subject-swap / object-swap
   / surface-variation cosine comparisons
 - intervention: interpolation, noise, dimension masking, token masking,
@@ -9,20 +8,15 @@ really encodes MEANING (not surface form).
   semantic probes (subject / object / action / polarity) from frozen latents
 """
 from __future__ import annotations
-
 from typing import Dict, List, Optional, Tuple
-
 import torch
 import torch.nn.functional as F
-
 from ..checkpoints import build_stage1_from_checkpoint, load_checkpoint
 from ..config import Config
 from ..generation import Generator
 from ..model.model import Stage1Model
 from ..utils.logging_utils import get_logger
-
 log = get_logger("semantic_eval")
-
 
 @torch.no_grad()
 def _semantic_of(model, tok, text: str, device: torch.device,
@@ -37,7 +31,6 @@ def _semantic_of(model, tok, text: str, device: torch.device,
         z = model.encode(x, mask, apply_noise=apply_noise)
     return z
 
-
 @torch.no_grad()
 def _cos(model: Stage1Model, tok, a: str, b: str, device) -> float:
     za = _semantic_of(model, tok, a, device).mean(dim=1)
@@ -46,14 +39,14 @@ def _cos(model: Stage1Model, tok, a: str, b: str, device) -> float:
 
 
 def run_semantic_tests(model: Stage1Model, tok, device: torch.device) -> Dict[str, float]:
-    """Five canonical comparisons from the project spec."""
+    """Five canonical comparisons from the project spec. ENGLISH VERSION"""
     tests = {
-        "paraphrase_same_meaning": ("小明吃了一个苹果。", "一个苹果被小明吃掉了。", "high"),
-        "different_meaning": ("小明吃了一个苹果。", "小明买了一辆汽车。", "low"),
-        "subject_swap": ("小明吃苹果", "小红吃苹果", "low-mid"),
-        "object_swap": ("小明吃苹果", "小明吃香蕉", "low-mid"),
-        "surface_variation": ("小明吃了一个苹果。", "小明正在吃一个苹果。", "high"),
-        "surface_variation2": ("小明吃了一个苹果。", "一个苹果被小明吃了。", "high"),
+        "paraphrase_same_meaning": ("Alice ate an apple.", "An apple was eaten by Alice.", "high"),
+        "different_meaning": ("Alice ate an apple.", "Alice bought a car.", "low"),
+        "subject_swap": ("Alice eats an apple.", "Bob eats an apple.", "low-mid"),
+        "object_swap": ("Alice eats an apple.", "Alice eats a banana.", "low-mid"),
+        "surface_variation": ("Alice ate an apple.", "Alice is eating an apple.", "high"),
+        "surface_variation2": ("Alice ate an apple.", "An apple was eaten by Alice.", "high"),
     }
     out = {name: _cos(model, tok, a, b, device) for name, (a, b, _) in tests.items()}
     out["contrast_margin"] = out["paraphrase_same_meaning"] - out["different_meaning"]
@@ -62,42 +55,36 @@ def run_semantic_tests(model: Stage1Model, tok, device: torch.device) -> Dict[st
 
 @torch.no_grad()
 def run_interventions(model: Stage1Model, tok, device, gen: Generator,
-                      prompt_a: str = "小明吃苹果",
-                      prompt_b: str = "小明吃香蕉") -> Dict[str, object]:
-    """Latent intervention suite on the semantic interface."""
+                      prompt_a: str = "Alice eats an apple.",
+                      prompt_b: str = "Alice eats a banana.") -> Dict[str, object]:
+    """Latent intervention suite on the semantic interface. ENGLISH"""
     za = _semantic_of(model, tok, prompt_a, device)
     zb = _semantic_of(model, tok, prompt_b, device)
     res: Dict[str, object] = {}
-
     # 1) interpolation sweep
     interps = {}
     for alpha in (0.0, 0.25, 0.5, 0.75, 1.0):
         zm = (1 - alpha) * za + alpha * zb
         interps[f"alpha={alpha}"] = gen.generate(prompt_a, latent=zm)
     res["interpolation"] = interps
-
     # 2) latent noise sweep
     noise = {}
     for std in (0.1, 0.5, 1.0):
         zn = za + torch.randn_like(za) * std
         noise[f"std={std}"] = gen.generate(prompt_a, latent=zn)
     res["latent_noise"] = noise
-
     # 3) semantic-token masking (zero out half the slots)
     zm = za.clone()
     zm[:, zm.size(1) // 2:] = 0.0
     res["token_masking_half"] = gen.generate(prompt_a, latent=zm)
-
     # 4) semantic-token swapping between A and B
     zs = za.clone()
     zs[:, ::2] = zb[:, ::2]
     res["token_swapping"] = gen.generate(prompt_a, latent=zs)
-
     # 5) dimension masking
     zd = za.clone()
     zd[..., : zd.size(-1) // 2] = 0.0
     res["dim_masking_half"] = gen.generate(prompt_a, latent=zd)
-
     # 6) zero-latent dependency (the collapse detector)
     real = gen.generate(prompt_a, latent=za, greedy=True)
     zero = gen.generate(prompt_a, latent=torch.zeros_like(za), greedy=True)
@@ -110,17 +97,16 @@ def run_interventions(model: Stage1Model, tok, device, gen: Generator,
 
 def run_probes(model, tok, triples, device, max_items: int = 400
                ) -> Dict[str, float]:
-    """Linear probes on frozen latents.
-
+    """Linear probes on frozen latents. ENGLISH vocab
     Semantic probe: predict subject / object word (chosen from the fixed
     vocabularies used to generate the corpus) from pooled latent.
-    Surface probe: predict exact last character (word-form proxy) and the
-    sentence length bucket (word-order/length proxy).
-
+    Surface probe: predict exact last token id and the sentence length bucket.
     Ideal research state: semantic probe acc HIGH, surface probe acc LOW.
     """
-    subj = ["小明", "小红", "老师", "妈妈", "爷爷", "姐姐", "男孩", "女孩"]
-    obj = ["苹果", "香蕉", "汽车", "书", "水杯", "面包", "钥匙", "花"]
+    # English subject / object word list, replace Chinese
+    subj = ["Alice", "Bob", "Teacher", "Mom", "Grandpa", "Sister", "Boy", "Girl"]
+    obj = ["apple", "banana", "car", "book", "cup", "bread", "key", "flower"]
+
     feats, s_lab, o_lab, surf_last, surf_len = [], [], [], [], []
     for p, t, _pt in triples[:max_items]:
         with torch.no_grad():  # latents are frozen inputs; the PROBE trains
