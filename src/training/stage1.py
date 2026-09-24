@@ -60,7 +60,10 @@ def validate(model: Stage1Model, loader, cfg: Config, device: torch.device,
             tot["ppl"] += math.exp(min(20.0, l_recon.item())) * B
             tot["acc"] += token_accuracy(out["logits"], labels, pad_id) * B
             n += B
-            latent_chunks.append(z.reshape(-1, z.size(-1)).cpu())
+            # cap accumulated latents: the stats below only need a sample;
+            # holding ALL validation latents grows memory with val size.
+            if sum(c.shape[0] for c in latent_chunks) < 4096:
+                latent_chunks.append(z.reshape(-1, z.size(-1)).cpu())
     model.train()
     stats = {k: v / max(1, n) for k, v in tot.items()}
     allz = torch.cat(latent_chunks)[:2048]
@@ -120,8 +123,12 @@ def train_stage1(cfg: Config, resume: Optional[str] = None) -> str:
             l_recon = reconstruction_loss(out["logits"], labels, pad_id=tok.pad_id)
             is_para = (batch["ptype"] == 1)
             if is_para.any():
-                # paraphrase rows carry (A, B) as prompt/target; align via target-side
-                z_b = model.encode(target[is_para], tmask[is_para], apply_noise=False)
+                # paraphrase rows carry (A, B) as prompt/target; the B side is a
+                # TARGET (no gradient needed) -> encode under no_grad. This both
+                # halves activation memory on paraphrase batches and matches the
+                # loss semantics (consistency toward a fixed anchor).
+                with torch.no_grad():
+                    z_b = model.encode(target[is_para], tmask[is_para], apply_noise=False)
                 l_para = paraphrase_consistency_loss(z[is_para], z_b)
             else:
                 l_para = torch.zeros((), device=device)
@@ -133,7 +140,11 @@ def train_stage1(cfg: Config, resume: Optional[str] = None) -> str:
             (loss / cfg.train.grad_accum).backward()
             if (gstep + 1) % cfg.train.grad_accum == 0:
                 if cfg.train.grad_clip > 0:
-                    gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
+                    # float() immediately: the returned tensor carries the whole
+                    # autograd graph; keeping it as a tensor across iterations
+                    # pins the previous step's graph in memory (real leak).
+                    gnorm = float(torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), cfg.train.grad_clip))
                 opt.step()
                 sched.step()
                 opt.zero_grad(set_to_none=True)
@@ -147,7 +158,7 @@ def train_stage1(cfg: Config, resume: Optional[str] = None) -> str:
                 writer.add_scalar("loss/variance", float(l_var), gstep)
                 writer.add_scalar("loss/decorrelation", float(l_cov), gstep)
                 writer.add_scalar("lr", sched.get_last_lr()[0], gstep)
-                writer.add_scalar("gradient_norm", float(gnorm), gstep)
+                writer.add_scalar("gradient_norm", gnorm, gstep)
                 for k, v in ls.items():
                     writer.add_scalar(f"latent/{k}", v, gstep)
                 pbar.set_postfix(loss=f"{loss.item():.3f}",
@@ -173,9 +184,10 @@ def train_stage1(cfg: Config, resume: Optional[str] = None) -> str:
                     save_checkpoint(ckpt_dir / "best.pt", model, opt, sched, epoch,
                                     gstep, best, cfg, tok_path(cfg),
                                     capture_random_state(), {"stage": 1})
-                save_checkpoint(ckpt_dir / f"epoch_{epoch}.pt", model, opt, sched,
-                                epoch, gstep, best, cfg, tok_path(cfg),
-                                capture_random_state(), {"stage": 1})
+                if cfg.train.save_epoch_checkpoints:
+                    save_checkpoint(ckpt_dir / f"epoch_{epoch}.pt", model, opt, sched,
+                                    epoch, gstep, best, cfg, tok_path(cfg),
+                                    capture_random_state(), {"stage": 1})
                 if cfg.train.patience is not None:
                     bad_vals = bad_vals + 1 if vs["loss"] > best else 0
                     if bad_vals >= cfg.train.patience:

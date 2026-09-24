@@ -67,6 +67,11 @@ class Generator:
 
         ids: List[int] = [self.tok.bos_id] + self.tok.encode(
             prompt, max_len=self.max_seq_len - 2)
+        # hard clamp: positional embeddings (and attention memory) are bounded
+        # by max_seq_len; a 2048-token gen config on a 256-len model would
+        # otherwise run a quadratic-time loop and then crash on pos-embedding
+        # indexing (~step 260).
+        max_len = max(1, min(max_len, self.max_seq_len - 1 - len(ids)))
         for _ in range(max_len):
             x = torch.tensor([ids], dtype=torch.long, device=self.device)
             logits = self.model.decoder.step(x, latent)

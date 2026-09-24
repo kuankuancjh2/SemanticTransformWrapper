@@ -1,23 +1,32 @@
+# Low-memory preset (Windows 小内存机器 / Kaggle CPU / 8GB 显卡).
+# 用法: python train_stage1.py --config configs/config.lowmem.yaml
+# 语义与默认配置完全一致，只降低内存占用：
+#   - batch_size 16 + grad_accum 2  → 等效 batch 32，激活内存减半
+#   - num_workers 0                 → Windows 下避免 spawn 复制整份进程内存
+#   - val_interval 500              → 减少 validation 期间的峰值内存
+#   - max_gen_len 32                → 生成循环更短
 model:
-  vocab_size: 276
-  max_seq_len: 256
+  vocab_size: 0
+  max_seq_len: 128
   hidden_dim: 512
   num_heads: 8
-  encoder_layers: 4
-  decoder_layers: 8
+  encoder_layers: 3
+  decoder_layers: 5
   ffn_dim: 2048
   dropout: 0.1
-  num_semantic_tokens: 32
+  num_semantic_tokens: 16
   encoder_layer_split: null
   decoder_sees_prompt: false
   tie_embeddings: true
+
 bottleneck:
-  noise_std: 0.05
+  noise_std: 0.1
   use_noise_train: true
   use_queries: true
-core:
-  type: bihopfield
-  num_layers: 8
+
+semantic_core:
+  type: transformer
+  num_layers: 2
   num_heads: 8
   ffn_dim: 2048
   dropout: 0.1
@@ -30,10 +39,11 @@ core:
   ssm_d_conv: 4
   ssm_expand: 2.0
   hopfield_beta: 1.0
-  hopfield_steps: 8
+  hopfield_steps: 3
   diffusion_steps: 4
   diffusion_schedule: cosine
   seed: 1234
+
 loss:
   paraphrase_weight: 0.5
   variance_weight: 1.0
@@ -42,45 +52,42 @@ loss:
   latent_weight: 1.0
   latent_cosine_weight: 0.5
   decode_weight: 1.0
+
 data:
   raw_dir: data/raw
   processed_dir: data/processed
   cache_dir: data/cache
   metadata_path: data/metadata.json
-  max_seq_len: 256
-  val_split: 0.04
-  test_split: 0.04
+  max_seq_len: 128
+  val_split: 0.1
+  test_split: 0.1
   seed: 42
-  hf_dataset: roskoN/dailydialog
-  tokenizer_type: bpe
-  bpe_vocab_size: 16000
+  hf_dataset: null
+  tokenizer_type: char
+  bpe_vocab_size: 4000
+
 train:
   device: auto
-  batch_size: 32
+  batch_size: 16
   lr: 0.0003
   weight_decay: 0.01
-  epochs: 50
+  epochs: 20
   max_steps: null
   warmup_steps: 500
-  grad_accum: 4
+  grad_accum: 2
   grad_clip: 1.0
-  val_interval: 1000
+  val_interval: 500
   patience: null
   amp: auto
-  num_workers: 0
+  num_workers: 0        # Windows 低内存关键项
   seed: 3407
   log_dir: logs
   checkpoint_dir: checkpoints
   samples_dir: samples
   log_interval: 50
-  preview_prompts:
-  - 今天天气很好，我决定
-  - 小明拿起苹果，然后
-  - 人工智能最重要的问题之一是
-  - 如果一个物体从桌子上掉下来，那么
-  - 我喜欢音乐，因为
+
 gen:
-  max_gen_len: 2048
+  max_gen_len: 32
   temperature: 0.7
   top_p: 0.9
   greedy: true

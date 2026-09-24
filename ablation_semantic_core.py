@@ -21,7 +21,8 @@ from src.utils.logging_utils import setup_logging
 from src.data import load_split
 from torch.utils.data import DataLoader
 
-CORES = ["identity", "random", "mlp", "transformer", "bihopfield"]
+CORES = ["identity", "random", "mlp", "transformer", "bihopfield", "conv",
+         "mamba", "diffusion"]
 
 
 def main() -> None:

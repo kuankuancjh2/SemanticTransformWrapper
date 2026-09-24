@@ -8,7 +8,7 @@ import torch
 
 from .config import Config
 from .model.model import Stage1Model, Stage2Model
-from .model.cores import _REGISTRY
+from .model.cores import build_semantic_core
 from .tokenization import load_tokenizer
 from .utils.seed import capture_random_state, restore_random_state
 
@@ -62,16 +62,9 @@ def build_stage2_from_checkpoint(ckpt: Dict[str, Any], device: torch.device
     stage1.load_state_dict(sd)
     stage1.to(device)
     core_type = ckpt.get("core_type") or cfg.core.type
-    core_cfg = cfg.core
-    core_cls = _REGISTRY[core_type]
-    core = core_cls(
-        d_model=cfg.model.hidden_dim,
-        num_semantic_tokens=cfg.model.num_semantic_tokens,
-        num_layers=core_cfg.num_layers, num_heads=core_cfg.num_heads,
-        ffn_dim=core_cfg.ffn_dim, dropout=core_cfg.dropout,
-        mlp_hidden=core_cfg.mlp_hidden, hopfield_beta=core_cfg.hopfield_beta,
-        hopfield_steps=core_cfg.hopfield_steps, seed=core_cfg.seed,
-    )
+    cfg.core.type = core_type
+    core = build_semantic_core(cfg.core, d_model=cfg.model.hidden_dim,
+                               num_semantic_tokens=cfg.model.num_semantic_tokens)
     if "core_state_dict" in ckpt and ckpt["core_state_dict"] is not None:
         core.load_state_dict(ckpt["core_state_dict"])
     core.to(device)

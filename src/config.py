@@ -55,15 +55,29 @@ class BottleneckConfig:
 
 @dataclass
 class SemanticCoreConfig:
-    # mlp | transformer | bihopfield | identity | random
+    # mlp | transformer | bihopfield | conv | mamba | diffusion | identity | random
     type: str = "transformer"
     num_layers: int = 2
     num_heads: int = 8
     ffn_dim: int = 2048
     dropout: float = 0.1
     mlp_hidden: int = 2048
+    # MLP core controls
+    mlp_depth: int = 2            # number of HIDDEN layers
+    mlp_activation: str = "gelu"  # gelu | relu | silu | tanh
+    # Conv core controls
+    conv_kernel: int = 3
+    conv_dilation: int = 1
+    # Mamba (selective SSM, pure PyTorch) controls
+    ssm_d_state: int = 16
+    ssm_d_conv: int = 4
+    ssm_expand: float = 2.0
+    # BiHopfield controls
     hopfield_beta: float = 1.0
     hopfield_steps: int = 3
+    # Diffusion core controls
+    diffusion_steps: int = 4
+    diffusion_schedule: str = "cosine"  # cosine | linear
     seed: int = 1234  # for the random core
 
 
@@ -113,6 +127,12 @@ class TrainConfig:
     amp: str = "auto"  # auto | bf16 | fp16 | off
     num_workers: int = 2
     seed: int = 3407
+    # Memory controls: keep only latest/best checkpoints (epoch snapshots are
+    # ~400MB each for the default architecture and churn disk/RAM on Windows).
+    save_epoch_checkpoints: bool = True
+    # pinned host memory: auto (CUDA only) | on | off. "off" avoids pinned-RAM
+    # pressure on small Windows machines.
+    pin_memory: str = "auto"
     log_dir: str = "logs"
     checkpoint_dir: str = "checkpoints"
     samples_dir: str = "samples"

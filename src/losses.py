@@ -56,6 +56,7 @@ def covariance_loss(z: torch.Tensor) -> torch.Tensor:
 
 def latent_stats(z: torch.Tensor) -> Dict[str, float]:
     zs = z.reshape(-1, z.size(-1)).detach().float()
+    zs = zs[:1024]  # cap rows: pairwise sim matrix is O(n^2), a sample suffices
     zn = F.normalize(zs, dim=-1)
     sim = (zn @ zn.T)
     k = zs.size(0)

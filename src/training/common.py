@@ -26,9 +26,11 @@ def make_loaders(cfg: Config, tok, stage: int) -> Tuple[DataLoader, DataLoader, 
 
     base = Path(cfg.data.processed_dir)
     pad = tok.pad_id
+    pin = (torch.cuda.is_available() if getattr(cfg.train, "pin_memory", "auto") == "auto"
+           else cfg.train.pin_memory == "on")
     common = dict(batch_size=cfg.train.batch_size, num_workers=cfg.train.num_workers,
                   collate_fn=lambda b: collate_pairs(b, pad),
-                  pin_memory=torch.cuda.is_available())
+                  pin_memory=pin)
     if stage == 1:
         tr = load_split(base / "stage1_train.jsonl")
         va = load_split(base / "stage1_val.jsonl")

@@ -1,0 +1,83 @@
+# Tiny smoke-test config (CPU, ~1 min per stage). NOT for real experiments.
+model:
+  vocab_size: 0
+  max_seq_len: 64
+  hidden_dim: 64
+  num_heads: 4
+  encoder_layers: 2
+  decoder_layers: 3
+  ffn_dim: 128
+  dropout: 0.1
+  num_semantic_tokens: 8
+  encoder_layer_split: null
+  decoder_sees_prompt: false
+  tie_embeddings: true
+bottleneck:
+  noise_std: 0.05
+  use_noise_train: true
+  use_queries: true
+core:
+  type: transformer
+  num_layers: 2
+  num_heads: 4
+  ffn_dim: 128
+  dropout: 0.1
+  mlp_hidden: 128
+  mlp_depth: 2
+  mlp_activation: gelu
+  conv_kernel: 3
+  conv_dilation: 2
+  ssm_d_state: 8
+  ssm_d_conv: 4
+  ssm_expand: 2.0
+  hopfield_beta: 1.0
+  hopfield_steps: 3
+  diffusion_steps: 3
+  diffusion_schedule: cosine
+  seed: 1234
+loss:
+  paraphrase_weight: 0.5
+  variance_weight: 1.0
+  covariance_weight: 1.0
+  variance_target: 1.0
+  latent_weight: 1.0
+  latent_cosine_weight: 0.5
+  decode_weight: 1.0
+data:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  cache_dir: data/cache
+  metadata_path: data/metadata.json
+  max_seq_len: 64
+  val_split: 0.1
+  test_split: 0.1
+  seed: 42
+  hf_dataset: null
+  tokenizer_type: char
+  bpe_vocab_size: 4000
+train:
+  device: cpu
+  batch_size: 16
+  lr: 0.0005
+  weight_decay: 0.01
+  epochs: 50
+  max_steps: null
+  warmup_steps: 10
+  grad_accum: 1
+  grad_clip: 1.0
+  val_interval: 30
+  patience: null
+  amp: auto
+  num_workers: 0
+  seed: 3407
+  log_dir: logs_smoke
+  checkpoint_dir: checkpoints_smoke
+  samples_dir: samples_smoke
+  log_interval: 10
+  save_epoch_checkpoints: false
+  pin_memory: "off"
+gen:
+  max_gen_len: 24
+  temperature: 0.7
+  top_p: 0.9
+  greedy: true

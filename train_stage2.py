@@ -21,7 +21,8 @@ def main() -> None:
     ap.add_argument("--stage1-checkpoint", required=True)
     ap.add_argument("--resume", default=None)
     ap.add_argument("--core", default=None,
-                    choices=["mlp", "transformer", "bihopfield", "identity", "random"])
+                    choices=["mlp", "transformer", "bihopfield", "conv", "mamba",
+                             "diffusion", "identity", "random"])
     ap.add_argument("--device", default=None)
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--lr", type=float, default=None)

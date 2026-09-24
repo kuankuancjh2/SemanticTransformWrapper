@@ -29,6 +29,7 @@ from .stage1 import tok_path
 log = get_logger("stage2")
 
 
+@torch.no_grad()
 def validate_stage2(model: Stage2Model, loader, cfg: Config, device: torch.device,
                     pad_id: int) -> Dict[str, float]:
     model.eval()
@@ -153,7 +154,10 @@ def train_stage2(cfg: Config, stage1_ckpt: str, resume: Optional[str] = None,
             opt.zero_grad(set_to_none=True)
             (loss / cfg.train.grad_accum).backward()
             if cfg.train.grad_clip > 0:
-                gnorm = torch.nn.utils.clip_grad_norm_(core.parameters(), cfg.train.grad_clip)
+                # float() immediately: tensor return value pins the autograd
+                # graph across iterations otherwise (real leak).
+                gnorm = float(torch.nn.utils.clip_grad_norm_(
+                    core.parameters(), cfg.train.grad_clip))
             opt.step()
             sched.step()
             gstep += 1
@@ -184,7 +188,8 @@ def train_stage2(cfg: Config, stage1_ckpt: str, resume: Optional[str] = None,
                 save("latest.pt", epoch, gstep, best)
                 if best_new:
                     save("best.pt", epoch, gstep, best)
-                save(f"epoch_{epoch}.pt", epoch, gstep, best)
+                if cfg.train.save_epoch_checkpoints:
+                    save(f"epoch_{epoch}.pt", epoch, gstep, best)
             if cfg.train.max_steps and gstep >= cfg.train.max_steps:
                 stop = True
                 break
