@@ -1,4 +1,5 @@
-"""Stage 1 entry: python train_stage1.py [--config ...] [--resume ...]"""
+"""Stage 1 entry: python train_stage1.py [--config ...] [--resume ...]
+VAE ablation toggles: --vae / --no-vae / --beta (override config.vae)."""
 from __future__ import annotations
 
 import argparse
@@ -25,6 +26,12 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--val-interval", type=int, default=None)
     ap.add_argument("--noise-std", type=float, default=None)
+    ap.add_argument("--vae", dest="vae", action="store_true", default=None,
+                    help="enable the Semantic VAE bottleneck (overrides config)")
+    ap.add_argument("--no-vae", dest="vae", action="store_false",
+                    help="disable the VAE (deterministic AE)")
+    ap.add_argument("--beta", type=float, default=None,
+                    help="KL weight when the VAE is enabled")
     ap.add_argument("--offline", action="store_true")
     args = ap.parse_args()
 
@@ -47,6 +54,10 @@ def main() -> None:
         cfg.train.val_interval = args.val_interval
     if args.noise_std is not None:
         cfg.bottleneck.noise_std = args.noise_std
+    if args.vae is not None:
+        cfg.vae.enabled = args.vae
+    if args.beta is not None:
+        cfg.vae.beta = args.beta
 
     setup_logging(cfg.train.log_dir)
     train_stage1(cfg, resume=args.resume)

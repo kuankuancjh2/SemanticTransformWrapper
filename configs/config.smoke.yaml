@@ -35,6 +35,20 @@ core:
   diffusion_steps: 3
   diffusion_schedule: cosine
   seed: 1234
+vae:
+  enabled: false
+  beta: 0.02
+  kl_warmup_steps: 20
+  free_bits: 0.05
+  logvar_clamp: 10.0
+  active_unit_threshold: 0.01
+eval:
+  data_preset: english
+  custom_tests_file: null
+  intervention_prompt_a: null
+  intervention_prompt_b: null
+  probe_subjects: null
+  probe_objects: null
 loss:
   paraphrase_weight: 0.5
   variance_weight: 1.0
@@ -65,7 +79,7 @@ train:
   warmup_steps: 10
   grad_accum: 1
   grad_clip: 1.0
-  val_interval: 30
+  val_interval: 20
   patience: null
   amp: auto
   num_workers: 0

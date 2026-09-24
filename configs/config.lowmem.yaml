@@ -1,10 +1,5 @@
 # Low-memory preset (Windows 小内存机器 / Kaggle CPU / 8GB 显卡).
 # 用法: python train_stage1.py --config configs/config.lowmem.yaml
-# 语义与默认配置完全一致，只降低内存占用：
-#   - batch_size 16 + grad_accum 2  → 等效 batch 32，激活内存减半
-#   - num_workers 0                 → Windows 下避免 spawn 复制整份进程内存
-#   - val_interval 500              → 减少 validation 期间的峰值内存
-#   - max_gen_len 32                → 生成循环更短
 model:
   vocab_size: 0
   max_seq_len: 128
@@ -18,13 +13,11 @@ model:
   encoder_layer_split: null
   decoder_sees_prompt: false
   tie_embeddings: true
-
 bottleneck:
   noise_std: 0.1
   use_noise_train: true
   use_queries: true
-
-semantic_core:
+core:
   type: transformer
   num_layers: 2
   num_heads: 8
@@ -43,7 +36,20 @@ semantic_core:
   diffusion_steps: 4
   diffusion_schedule: cosine
   seed: 1234
-
+vae:
+  enabled: false
+  beta: 0.01
+  kl_warmup_steps: 2000
+  free_bits: 0.05
+  logvar_clamp: 10.0
+  active_unit_threshold: 0.01
+eval:
+  data_preset: english
+  custom_tests_file: null
+  intervention_prompt_a: null
+  intervention_prompt_b: null
+  probe_subjects: null
+  probe_objects: null
 loss:
   paraphrase_weight: 0.5
   variance_weight: 1.0
@@ -52,7 +58,6 @@ loss:
   latent_weight: 1.0
   latent_cosine_weight: 0.5
   decode_weight: 1.0
-
 data:
   raw_dir: data/raw
   processed_dir: data/processed
@@ -65,7 +70,6 @@ data:
   hf_dataset: null
   tokenizer_type: char
   bpe_vocab_size: 4000
-
 train:
   device: auto
   batch_size: 16
@@ -79,13 +83,14 @@ train:
   val_interval: 500
   patience: null
   amp: auto
-  num_workers: 0        # Windows 低内存关键项
+  num_workers: 0
   seed: 3407
   log_dir: logs
   checkpoint_dir: checkpoints
   samples_dir: samples
   log_interval: 50
-
+  save_epoch_checkpoints: false
+  pin_memory: "off"
 gen:
   max_gen_len: 32
   temperature: 0.7

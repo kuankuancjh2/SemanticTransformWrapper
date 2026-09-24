@@ -30,7 +30,9 @@ class Stage1Model(nn.Module):
         self.bottleneck = SemanticBottleneck(
             m.hidden_dim, m.num_heads, m.num_semantic_tokens, m.dropout,
             noise_std=cfg.bottleneck.noise_std,
-            use_noise_train=cfg.bottleneck.use_noise_train)
+            use_noise_train=cfg.bottleneck.use_noise_train,
+            use_vae=cfg.vae.enabled,
+            logvar_clamp=cfg.vae.logvar_clamp)
         self.decoder = LanguageDecoder(
             m.vocab_size, m.hidden_dim, m.num_heads, m.decoder_layers,
             m.ffn_dim, m.max_seq_len, m.dropout, pad_id=0,
@@ -39,8 +41,10 @@ class Stage1Model(nn.Module):
     # ------------------------------------------------------------- encoding
     def encode(self, ids: torch.Tensor, padding_mask: Optional[torch.Tensor] = None,
                noise_std: float | None = None,
-               apply_noise: bool | None = None) -> torch.Tensor:
-        """text ids [B, T] -> semantic tokens [B, K, D]."""
+               apply_noise: bool | None = None,
+               sample: bool | None = None) -> torch.Tensor:
+        """text ids [B, T] -> semantic tokens [B, K, D].
+        sample: VAE mode -- None follows mode, False forces mu (deterministic)."""
         split = self.cfg.model.encoder_layer_split
         if split is not None:
             layers = self.encoder(ids, padding_mask, return_all_layers=True)
@@ -48,7 +52,7 @@ class Stage1Model(nn.Module):
         else:
             enc = self.encoder(ids, padding_mask)
         return self.bottleneck(enc, padding_mask, noise_std=noise_std,
-                               apply_noise=apply_noise)
+                               apply_noise=apply_noise, sample=sample)
 
     # ------------------------------------------------------------- decoding
     def decode_logits(self, tgt_in: torch.Tensor, semantic_tokens: torch.Tensor,
@@ -61,14 +65,24 @@ class Stage1Model(nn.Module):
     def forward(self, prompt_ids: torch.Tensor, prompt_mask: torch.Tensor,
                 tgt_in: torch.Tensor, tgt_mask: torch.Tensor,
                 noise_std: float | None = None) -> dict:
-        """Teacher-forced pass. tgt_in starts with BOS, no EOS (labels = shifted)."""
+        """Teacher-forced pass. tgt_in starts with BOS, no EOS (labels = shifted).
+
+        VAE mode additionally returns 'mu' / 'logvar' for the KL term
+        (both None when the VAE is disabled).
+        """
         enc = self.encoder(prompt_ids, prompt_mask)
-        z = self.bottleneck(enc, prompt_mask, noise_std=noise_std)
+        if self.bottleneck.use_vae:
+            z, mu, logvar = self.bottleneck(enc, prompt_mask, noise_std=noise_std,
+                                            return_dist=True)
+        else:
+            z = self.bottleneck(enc, prompt_mask, noise_std=noise_std)
+            mu = logvar = None  # AE mode: no distribution heads
         logits = self.decoder(
             tgt_in, z, tgt_mask,
             enc if self.decoder.sees_prompt else None,
             prompt_mask if self.decoder.sees_prompt else None)
-        return {"logits": logits, "semantic": z, "encoder_states": enc}
+        return {"logits": logits, "semantic": z, "mu": mu, "logvar": logvar,
+                "encoder_states": enc}
 
 
 class Stage2Model(nn.Module):

@@ -82,6 +82,41 @@ class SemanticCoreConfig:
 
 
 @dataclass
+class VAEConfig:
+    """Stage-1-only optional VAE bottleneck (AE vs VAE is a toggle).
+
+    L = L_recon + beta_eff * KL(q(z|x) || N(0, I)) + (existing reg terms)
+    beta_eff = beta * min(1, step / kl_warmup_steps)   [KL annealing]
+    free_bits: per-latent-dim KL below this is not penalized
+               (anti posterior-collapse; Bowden et al. 2016 style)
+    """
+    enabled: bool = False
+    beta: float = 0.01          # token-level CE: common range 0.001-0.1
+    kl_warmup_steps: int = 2000  # 0 = no annealing
+    free_bits: float = 0.05
+    logvar_clamp: float = 10.0   # clamp on logvar (both signs)
+    active_unit_threshold: float = 0.01  # nats/dim: count as "active"
+
+
+@dataclass
+class EvalConfig:
+    """Where the semantic-eval sentences come from (was hard-coded).
+
+    data_preset: 'english' (default) | 'chinese' | 'custom'
+    custom_tests_file: JSON file for preset='custom' with optional keys:
+      {"tests": {name: [text_a, text_b]}, "intervention_a": str,
+       "intervention_b": str, "probe_subjects": [..], "probe_objects": [..]}
+    The explicit fields below override the selected preset when not null.
+    """
+    data_preset: str = "english"
+    custom_tests_file: Optional[str] = None
+    intervention_prompt_a: Optional[str] = None
+    intervention_prompt_b: Optional[str] = None
+    probe_subjects: Optional[list] = None
+    probe_objects: Optional[list] = None
+
+
+@dataclass
 class LossConfig:
     # Stage 1
     paraphrase_weight: float = 0.5
@@ -160,10 +195,12 @@ class Config:
     model: ModelConfig = field(default_factory=ModelConfig)
     bottleneck: BottleneckConfig = field(default_factory=BottleneckConfig)
     core: SemanticCoreConfig = field(default_factory=SemanticCoreConfig)
+    vae: VAEConfig = field(default_factory=VAEConfig)
     loss: LossConfig = field(default_factory=LossConfig)
     data: DataConfig = field(default_factory=DataConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     gen: GenerationConfig = field(default_factory=GenerationConfig)
+    eval: EvalConfig = field(default_factory=EvalConfig)
 
     # ------------------------------------------------------------------ IO
     def to_dict(self) -> Dict[str, Any]:
@@ -177,7 +214,8 @@ class Config:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Config":
         cfg = cls()
-        for sect in ("model", "bottleneck", "core", "loss", "data", "train", "gen"):
+        for sect in ("model", "bottleneck", "core", "vae", "loss", "data", "train",
+                     "gen", "eval"):
             if sect in d and d[sect]:
                 sub = getattr(cfg, sect)
                 valid = {f.name for f in dataclasses.fields(sub)}

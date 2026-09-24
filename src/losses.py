@@ -83,6 +83,39 @@ def stage1_total(losses: Dict[str, torch.Tensor], cfg_loss) -> torch.Tensor:
             + cfg_loss.covariance_weight * losses["covariance"])
 
 
+# ------------------------------------------------------------------- VAE (S1)
+def kl_divergence_loss(mu: torch.Tensor, logvar: torch.Tensor,
+                       free_bits: float = 0.0):
+    """KL( N(mu, sigma) || N(0, I) ), diagonal gaussians.
+
+    Returns (kl_for_loss, kl_raw):
+      kl_raw      -- the true KL (nats per latent, summed over K*D dims,
+                     averaged over batch) for monitoring.
+      kl_for_loss -- free-bits form: per-DIM KL is averaged over batch/K,
+                     floored at `free_bits`, then summed. Below the floor the
+                     gradient is zero, so the KL term cannot squeeze inactive
+                     units further (anti posterior-collapse); dims above the
+                     floor are penalized normally.
+    """
+    kl_map = 0.5 * (mu.pow(2) + torch.exp(logvar) - logvar - 1.0)  # [B,K,D]
+    kl_raw = kl_map.sum(-1).mean()
+    if free_bits > 0:
+        per_dim = kl_map.reshape(-1, kl_map.size(-1)).mean(0)
+        kl_for_loss = per_dim.clamp(min=free_bits).sum()
+    else:
+        kl_for_loss = kl_raw
+    return kl_for_loss, kl_raw
+
+
+@torch.no_grad()
+def active_units(mu: torch.Tensor, logvar: torch.Tensor,
+                 threshold: float = 0.01) -> int:
+    """#latent dims whose mean KL(nats) exceeds `threshold` (collapse monitor)."""
+    kl_map = 0.5 * (mu.pow(2) + torch.exp(logvar) - logvar - 1.0)
+    per_dim = kl_map.reshape(-1, kl_map.size(-1)).mean(0)
+    return int((per_dim > threshold).sum().item())
+
+
 # --------------------------------------------------------------------- stage 2
 def latent_set_loss(z_pred: torch.Tensor, z_target: torch.Tensor,
                     cosine_weight: float = 0.5) -> Dict[str, torch.Tensor]:

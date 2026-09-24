@@ -96,3 +96,47 @@ project/
 ├── ablation_semantic_core.py
 ├── configs/config.yaml  requirements.txt  README.md
 ```
+
+## Semantic VAE（Stage 1 可选，ablation 用）
+
+默认仍是 deterministic AE；`vae.enabled: true`（或 `--vae`）切换为 Semantic VAE：
+
+```
+sentence -> Encoder -> 32x512 -> [mu_head, logvar_head]
+   z = mu + exp(0.5*logvar) * eps   (训练，重参数化采样)
+   z = mu                            (eval / 推理 / sample=False 确定性锚点)
+```
+
+- Loss：`L = L_recon + beta_eff*KL(q(z|x)||N(0,I)) + paraphrase/variance/covariance`
+- KL 退火：`beta_eff = beta * min(1, step / kl_warmup_steps)`（TensorBoard: `vae/beta_eff`）
+- 防 posterior collapse：free bits（每维 KL 下限 `free_bits`，下限内梯度为零）、
+  `logvar_clamp`、active-units 监控（`vae/active_units`，KL(nats) 超过
+  `active_unit_threshold` 的维度数；`vae/kl` 持续≈0 且 au 掉到 0 = 塌缩）
+- Stage 2 / 全部 8 种 core 零改动：bottleneck 对外仍是 `[B,K,D]` 接口，
+  Stage 2 拿到的是确定性的 mu
+- 老 checkpoint / 旧 YAML 完全兼容（vae/eval 段缺省 = AE + english preset）
+
+```bash
+python train_stage1.py --vae --beta 0.01        # VAE
+python train_stage1.py --no-vae                 # AE（对照）
+python evaluate.py --checkpoint checkpoints/stage1/best.pt --eval-preset english
+```
+
+## Semantic Eval 数据集配置化
+
+`src/evaluation/semantic_eval.py` 原来硬编码中文测试句，现在全部走 config：
+
+```yaml
+eval:
+  data_preset: english   # english（默认）| chinese | custom
+  custom_tests_file: null  # preset=custom 时的 JSON：
+                           # {"tests": {"name": ["A", "B"]},
+                           #  "intervention_a": "...", "intervention_b": "...",
+                           #  "probe_subjects": [...], "probe_objects": [...]}
+  intervention_prompt_a: null  # 显式字段 > preset（可只覆盖其中一项）
+  probe_subjects: null
+  probe_objects: null
+```
+
+CLI 覆盖：`--eval-preset english|chinese|custom`、`--custom-tests file.json`。
+注意 probe 词表要与语料语言匹配，否则 subject/object probe 为 0。

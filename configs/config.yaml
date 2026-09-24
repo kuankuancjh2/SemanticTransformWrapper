@@ -1,5 +1,5 @@
 model:
-  vocab_size: 276
+  vocab_size: 16000
   max_seq_len: 256
   hidden_dim: 512
   num_heads: 8
@@ -16,13 +16,13 @@ bottleneck:
   use_noise_train: true
   use_queries: true
 core:
-  type: bihopfield
+  type: mlp
   num_layers: 8
   num_heads: 8
   ffn_dim: 2048
   dropout: 0.1
   mlp_hidden: 2048
-  mlp_depth: 2
+  mlp_depth: 8
   mlp_activation: gelu
   conv_kernel: 3
   conv_dilation: 1
@@ -34,6 +34,13 @@ core:
   diffusion_steps: 4
   diffusion_schedule: cosine
   seed: 1234
+vae:
+  enabled: true
+  beta: 0.01
+  kl_warmup_steps: 200
+  free_bits: 0.05
+  logvar_clamp: 10.0
+  active_unit_threshold: 0.01
 loss:
   paraphrase_weight: 0.5
   variance_weight: 1.0
@@ -69,18 +76,27 @@ train:
   amp: auto
   num_workers: 0
   seed: 3407
+  save_epoch_checkpoints: true
+  pin_memory: auto
   log_dir: logs
   checkpoint_dir: checkpoints
   samples_dir: samples
   log_interval: 50
   preview_prompts:
-  - 今天天气很好，我决定
-  - 小明拿起苹果，然后
-  - 人工智能最重要的问题之一是
-  - 如果一个物体从桌子上掉下来，那么
-  - 我喜欢音乐，因为
+  - The weather today is good, 
+  - Alice picked up the book and
+  - The most important thing about AI is
+  - If a book dropped from the table, 
+  - I like music beacause
 gen:
   max_gen_len: 2048
   temperature: 0.7
   top_p: 0.9
   greedy: true
+eval:
+  data_preset: english
+  custom_tests_file: null
+  intervention_prompt_a: null
+  intervention_prompt_b: null
+  probe_subjects: null
+  probe_objects: null
