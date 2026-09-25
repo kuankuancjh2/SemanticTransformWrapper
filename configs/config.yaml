@@ -16,7 +16,7 @@ bottleneck:
   use_noise_train: true
   use_queries: true
 core:
-  type: mlp
+  type: bihopfield
   num_layers: 8
   num_heads: 8
   ffn_dim: 2048
@@ -30,7 +30,7 @@ core:
   ssm_d_conv: 4
   ssm_expand: 2.0
   hopfield_beta: 1.0
-  hopfield_steps: 8
+  hopfield_steps: 20
   diffusion_steps: 4
   diffusion_schedule: cosine
   seed: 1234
