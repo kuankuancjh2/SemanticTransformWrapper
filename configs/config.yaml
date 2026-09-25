@@ -83,11 +83,11 @@ train:
   samples_dir: samples
   log_interval: 50
   preview_prompts:
-  - The weather today is good, 
-  - Alice picked up the book and
-  - The most important thing about AI is
-  - If a book dropped from the table, 
-  - I like music beacause
+  - The weather today is good, I want to go hiking.
+  - Alice picked up the book and asked me to read it aloud.
+  - Is the most important thing about AI its ability to understand natural language?
+  - A book dropped from the table.
+  - I like music beacause it makes me feel happy and relaxed.
 gen:
   max_gen_len: 2048
   temperature: 0.7
