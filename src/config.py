@@ -55,7 +55,7 @@ class BottleneckConfig:
 
 @dataclass
 class SemanticCoreConfig:
-    # mlp | transformer | bihopfield | conv | mamba | diffusion | identity | random
+    # mlp | transformer | bihopfield | global_mlp | conv | mamba | diffusion | identity | random
     type: str = "transformer"
     num_layers: int = 2
     num_heads: int = 8
@@ -75,6 +75,7 @@ class SemanticCoreConfig:
     # BiHopfield controls
     hopfield_beta: float = 1.0
     hopfield_steps: int = 3
+    bi_detach_state: bool = True  # bihopfield: detach persistent state between calls
     # Diffusion core controls
     diffusion_steps: int = 4
     diffusion_schedule: str = "cosine"  # cosine | linear

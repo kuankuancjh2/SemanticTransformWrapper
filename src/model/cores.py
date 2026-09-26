@@ -12,7 +12,13 @@ save/load-able (state_dict) and runs in constant memory per step.
 Available cores (all parameterizable from `SemanticCoreConfig` / YAML):
   mlp         depth/width/activation controlled position-wise MLP
   transformer bidirectional Transformer encoder over semantic tokens
-  bihopfield  modern Hopfield associative memory (layer-count + beta + steps)
+  bihopfield  PERSISTENT-STATE neural dynamics (see class docstring):
+              [B, depth, K, D] state surviving across calls, discrete tick
+              loop, dual-axis (token + depth) fully-connected MLP mixing,
+              tick/depth embeddings, gated-delta updates, collapse
+              diagnostic. NO attention anywhere.
+  global_mlp  flatten [B,K,D] -> deep fully-connected MLP over ALL tokens
+              jointly (every intermediate layer connects every token)
   conv        1D convolutional core (kernel / depth / dilation)
   mamba       selective SSM (Mamba-style) in PURE PyTorch (no mamba_ssm CUDA
               dependency -- runs on CPU / Kaggle / Windows)
@@ -24,16 +30,16 @@ Available cores (all parameterizable from `SemanticCoreConfig` / YAML):
 from __future__ import annotations
 
 import math
-from typing import Callable, Dict, Type
+from typing import Callable, Dict, Tuple
 
 import torch
 import torch.nn as nn
 
-_REGISTRY: Dict[str, Type["SemanticCore"]] = {}
+_REGISTRY: Dict[str, type] = {}
 
 
-def register(name: str) -> Callable[[Type["SemanticCore"]], Type["SemanticCore"]]:
-    def deco(cls: Type["SemanticCore"]) -> Type["SemanticCore"]:
+def register(name: str) -> Callable[[type], type]:
+    def deco(cls: type) -> type:
         _REGISTRY[name] = cls
         cls.name = name
         return cls
@@ -41,11 +47,27 @@ def register(name: str) -> Callable[[Type["SemanticCore"]], Type["SemanticCore"]
 
 
 class SemanticCore(nn.Module):
-    """Base class. Subclasses MUST only implement forward([B,K,D]) -> [B,K,D]."""
+    """Base class. Subclasses MUST only implement forward([B,K,D]) -> [B,K,D].
+    Memory-capable cores additionally implement forward_with_state(z, state,
+    cond) -> (z_out, new_state) and set supports_memory=True."""
     name = "base"
+    supports_memory = False
+    accepts_cond = False
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:  # pragma: no cover
         raise NotImplementedError
+
+    def forward_with_state(self, z: torch.Tensor, state=None, cond=None
+                           ) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        return self.forward(z), None
+
+
+def core_forward(core: "SemanticCore", z: torch.Tensor, state=None, cond=None):
+    """Single dispatch used by trainers/generators: memory cores get
+    (state, cond), everything else keeps the plain z -> z contract."""
+    if getattr(core, "supports_memory", False):
+        return core.forward_with_state(z, state=state, cond=cond)
+    return core(z), None
 
 
 # ----------------------------------------------------------------- activations
@@ -72,10 +94,10 @@ class SemanticMLP(SemanticCore):
                            f"Available: {sorted(_ACTS)}")
         hidden_dims = [mlp_hidden] * max(1, mlp_depth)
         dims = [d_model] + hidden_dims + [d_model]
-        layers: list[nn.Module] = [nn.LayerNorm(d_model)]
+        layers: list = [nn.LayerNorm(d_model)]
         for i in range(len(dims) - 1):
             layers += [nn.Linear(dims[i], dims[i + 1])]
-            if i < len(dims) - 2:  # no activation on the output projection
+            if i < len(dims) - 2:
                 layers += [act(), nn.Dropout(dropout)]
         self.net = nn.Sequential(*layers)
 
@@ -86,7 +108,7 @@ class SemanticMLP(SemanticCore):
 # ----------------------------------------------------------------- Transformer
 @register("transformer")
 class SemanticTransformer(SemanticCore):
-    """Bidirectional Transformer encoder over semantic tokens (default core).
+    """Bidirectional Transformer encoder over semantic tokens.
     Controllable: num_layers, num_heads, ffn_dim."""
 
     def __init__(self, d_model: int, num_semantic_tokens: int, num_layers: int = 2,
@@ -106,54 +128,159 @@ class SemanticTransformer(SemanticCore):
 # ----------------------------------------------------------------- BiHopfield
 @register("bihopfield")
 class SemanticBiHopfield(SemanticCore):
-    """Modern (energy-based) Hopfield association over semantic tokens:
-    repeated beta-scaled softmax associative recall against ALL semantic
-    tokens (Ramsauer et al. 2020 style), with a controllable stack depth.
-    Controllable: num_layers (Hopfield block count), hopfield_beta,
-    hopfield_steps (inner energy-descent iterations)."""
+    """BiHopfield: persistent-state neural-dynamics semantic core.
 
-    def __init__(self, d_model: int, num_semantic_tokens: int, num_layers: int = 2,
-                 hopfield_beta: float = 1.0, hopfield_steps: int = 3,
-                 dropout: float = 0.1, **kw) -> None:
+    This is the REAL BiHopfield design (non-autoregressive, persistent
+    latent state) -- NOT a transformer-style mixer:
+
+    - persistent state S: [B, depth, K, D] that survives across calls --
+      multi-turn context lives in this state, not in a concatenated prompt.
+      The state tensor is carried EXPLICITLY by the caller (trainer /
+      generator) so batching stays honest and checkpoints stay clean.
+    - discrete tick loop: `hopfield_steps` inner time-steps; each tick reads
+      the current state and produces the next state (dynamics, not one
+      forward pass).
+    - mixing is done by FULLY-CONNECTED layers on TWO axes (no attention):
+        * token axis (K x K): every semantic slot reads every slot
+        * depth axis (depth x depth): state slices interact
+        * token-wise MLP (D -> 2D -> D)
+    - tick embedding + depth embedding (which tick / which slice),
+      pre-LayerNorm, and a GATED DELTA update  S <- S + g * delta.
+    - collapse diagnostic: `last_diag` holds batch-variance and mean pairwise
+      cosine of the (depth-pooled) state after every call.
+
+    Controllable: num_layers = state depth (P), hopfield_steps = ticks,
+    bi_detach_state (detach state between calls: True = truncated dynamics,
+    False = BPTT through the whole tick chain)."""
+
+    supports_memory = True
+    accepts_cond = False
+
+    def __init__(self, d_model: int, num_semantic_tokens: int, num_layers: int = 8,
+                 hopfield_steps: int = 20, dropout: float = 0.1,
+                 bi_detach_state: bool = True, **kw) -> None:
         super().__init__()
-        self.beta = hopfield_beta
-        self.steps = hopfield_steps
-        self.W = nn.ModuleList([nn.Linear(d_model, d_model, bias=False)
-                                for _ in range(max(1, num_layers))])
-        self.norms = nn.ModuleList([nn.LayerNorm(d_model)
-                                    for _ in range(max(1, num_layers))])
+        self.depth = max(1, num_layers)
+        self.steps = max(1, hopfield_steps)
+        self.K = num_semantic_tokens
+        self.D = d_model
+        self.detach_state = bi_detach_state
+        # dynamics weights (shared across ticks; tick/depth embeddings give
+        # the time/slice specificity)
+        self.norm_state = nn.LayerNorm(d_model)
+        self.tok_mlp = nn.Sequential(
+            nn.Linear(d_model, 2 * d_model), nn.GELU(),
+            nn.Linear(2 * d_model, d_model))
+        self.seq_mix = nn.Linear(self.K, self.K, bias=False)            # token axis
+        self.depth_mix = nn.Linear(self.depth, self.depth, bias=False)  # depth axis
+        self.tick_emb = nn.Embedding(self.steps + 1, d_model)
+        self.depth_emb = nn.Embedding(self.depth, d_model)
+        self.gate = nn.Sequential(nn.Linear(d_model, d_model), nn.Sigmoid())
+        self.readout = nn.Linear(d_model, d_model)
+        self.norm_out = nn.LayerNorm(d_model)
+        self.last_diag: Dict[str, float] = {}
+
+    # ------------------------------------------------------------ state utils
+    def init_state(self, batch: int, device, dtype=None) -> torch.Tensor:
+        dtype = dtype or torch.get_default_dtype()
+        return torch.zeros(batch, self.depth, self.K, self.D,
+                           device=device, dtype=dtype)
+
+    def _tick(self, S: torch.Tensor, z: torch.Tensor, t: int) -> torch.Tensor:
+        """One discrete tick: S [B, P, K, D] + stimulus z [B, K, D] -> S'."""
+        P = self.depth
+        te = self.tick_emb(torch.tensor(t, device=S.device, dtype=torch.long))
+        Sx = self.norm_state(S + te.view(1, 1, 1, -1)
+                             + self.depth_emb.weight.view(1, P, 1, -1).to(S.dtype))
+        h = self.tok_mlp(Sx)                                      # token-wise MLP
+        h = h + self.seq_mix(Sx.transpose(2, 3)).transpose(2, 3)  # K-axis FC
+        h = h + self.depth_mix(Sx.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        return S + self.gate(Sx) * h                              # gated delta
+
+    def _diag(self, S: torch.Tensor) -> Dict[str, float]:
+        with torch.no_grad():
+            pooled = S.mean(dim=1).reshape(S.size(0), -1)         # [B, K*D]
+            var = float(pooled.var(dim=0).mean())
+            pn = torch.nn.functional.normalize(pooled, dim=-1)
+            sim = pn @ pn.T
+            off = sim[~torch.eye(S.size(0), dtype=torch.bool, device=S.device)]
+            cos = float(off.mean()) if off.numel() else 0.0
+            return {"state_batch_var": var, "state_pairwise_cos": cos}
+
+    # -------------------------------------------------------------- interface
+    def forward_with_state(self, z: torch.Tensor, state: torch.Tensor | None = None,
+                           cond: torch.Tensor | None = None):
+        """z: [B, K, D] stimulus; state: [B, depth, K, D] or None (= zeros).
+        Returns (z_out [B, K, D], new_state). The returned state is detached
+        between calls unless bi_detach_state=False (BPTT through ticks)."""
+        S = state if state is not None else self.init_state(z.size(0), z.device, z.dtype)
+        for t in range(self.steps):
+            S = self._tick(S, z, t)
+        z_out = self.norm_out(z + self.readout(S.mean(dim=1)))
+        new_state = S.detach() if self.detach_state else S
+        self.last_diag = self._diag(new_state)
+        return z_out, new_state
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        for W, N in zip(self.W, self.norms):
-            state = N(z)
-            for _ in range(self.steps):
-                # associative recall: each token retrieves from all tokens
-                attn = torch.softmax(self.beta * state @ state.transpose(-1, -2), dim=-1)
-                state = attn @ state
-            z = z + W(state)
-        return z
+        """Stateless contract call (ablation / single-shot): fresh zero state."""
+        z_out, _ = self.forward_with_state(z, state=None)
+        return z_out
+
+
+# ----------------------------------------------------------------- Global MLP
+@register("global_mlp")
+class SemanticGlobalMLP(SemanticCore):
+    """Global fully-connected core: ALL K semantic tokens are jointly
+    connected through the intermediate layers -- the [B, K, D] latent is
+    flattened to [B, K*D] and pushed through a deep MLP, so every layer
+    sees and mixes every token and every dimension (no per-token
+    independence, no attention).
+    Controllable: mlp_depth (hidden layer count), mlp_hidden (width).
+    NOTE: parameter count scales ~ (K*D)^2; at K=32 / D=512 / hidden=2048 /
+    depth=8 this is ~96M params (that is the point of the core)."""
+
+    def __init__(self, d_model: int, num_semantic_tokens: int,
+                 mlp_hidden: int = 2048, mlp_depth: int = 2,
+                 dropout: float = 0.1, **kw) -> None:
+        super().__init__()
+        self.K = num_semantic_tokens
+        self.D = d_model
+        self.kd = d_model * num_semantic_tokens
+        dims = [self.kd] + [mlp_hidden] * max(1, mlp_depth) + [self.kd]
+        layers: list = [nn.LayerNorm(self.kd)]
+        for i in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            if i < len(dims) - 2:
+                layers += [nn.GELU(), nn.Dropout(dropout)]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        B, K, D = z.shape
+        if K * D != self.kd:
+            raise ValueError(
+                f"global_mlp was built for K*D={self.kd} but got {K}*{D}; "
+                "rebuild with matching num_semantic_tokens/hidden_dim")
+        return z + self.net(z.reshape(B, self.kd)).view(B, K, D)
 
 
 # ------------------------------------------------------------------------- Conv
 @register("conv")
 class SemanticConv(SemanticCore):
     """1D causal-free convolutional core over the K semantic slots.
-    Controllable: conv_kernel (kernel size), num_layers (depth),
-    conv_dilation (receptive-field growth). Output length is always K
-    (asymmetric padding + crop), so the interface contract holds."""
+    Controllable: conv_kernel, num_layers, conv_dilation. Output length is
+    always K (asymmetric padding + crop), so the interface contract holds."""
 
     def __init__(self, d_model: int, num_semantic_tokens: int, num_layers: int = 2,
                  conv_kernel: int = 3, conv_dilation: int = 1,
                  dropout: float = 0.1, **kw) -> None:
         super().__init__()
-        k = conv_kernel
-        self.kernel = k
+        self.kernel = conv_kernel
         self.dilation = conv_dilation
         self.blocks = nn.ModuleList()
         for _ in range(max(1, num_layers)):
             self.blocks.append(nn.ModuleDict({
                 "norm": nn.LayerNorm(d_model),
-                "conv": nn.Conv1d(d_model, d_model, kernel_size=k,
+                "conv": nn.Conv1d(d_model, d_model, kernel_size=conv_kernel,
                                   dilation=conv_dilation, padding=0),
                 "act": nn.GELU(),
                 "drop": nn.Dropout(dropout),
@@ -161,7 +288,6 @@ class SemanticConv(SemanticCore):
         self.out_norm = nn.LayerNorm(d_model)
 
     def _pad(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, D, K]; asymmetric padding keeps length K for any kernel/dilation
         left = (self.dilation * (self.kernel - 1)) // 2
         right = self.dilation * (self.kernel - 1) - left
         return nn.functional.pad(x, (left, right))
@@ -179,10 +305,8 @@ class SemanticConv(SemanticCore):
 
 # ------------------------------------------------------------------------ Mamba
 class _MambaBlock(nn.Module):
-    """Selective SSM block (Mamba-style, pure PyTorch).
-    Selectivity: per-token input-dependent Delta/B/C; recurrent scan over the
-    K semantic slots. K is tiny (e.g. 16) so the python scan loop is cheap and
-    memory-constant -- no CUDA kernel or mamba_ssm dependency needed."""
+    """Selective SSM block (Mamba-style, pure PyTorch). K is tiny (e.g. 16)
+    so the python scan loop is cheap and memory-constant."""
 
     def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4,
                  expand: float = 2.0, dropout: float = 0.1) -> None:
@@ -195,7 +319,6 @@ class _MambaBlock(nn.Module):
                               padding=d_conv - 1, groups=self.d_inner, bias=True)
         self.x_proj = nn.Linear(self.d_inner, self.dt_rank + 2 * d_state, bias=False)
         self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
-        # S4D-real initialization of A (log-magnitude, negative = decaying)
         A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
         self.A_log = nn.Parameter(torch.log(A))
         self.D = nn.Parameter(torch.ones(self.d_inner))
@@ -204,43 +327,37 @@ class _MambaBlock(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [B, K, d_model] -> [B, K, d_model]"""
         B_, K, _ = x.shape
         res = x
         x = self.norm(x)
-        xz = self.in_proj(x)                       # [B, K, 2*d_inner]
-        h, gate = xz.chunk(2, dim=-1)              # [B, K, d_inner] each
-        # depthwise causal-free local conv (crop back to K)
-        h = h.transpose(1, 2)
-        h = self.conv(h)[..., :K].transpose(1, 2)  # [B, K, d_inner]
+        xz = self.in_proj(x)
+        h, gate = xz.chunk(2, dim=-1)
+        h = self.conv(h.transpose(1, 2))[..., :K].transpose(1, 2)
         h = torch.nn.functional.silu(h)
-
-        dbc = self.x_proj(h)                       # [B, K, dt_rank + 2*d_state]
+        dbc = self.x_proj(h)
         dt = dbc[..., : self.dt_rank]
         Bmat = dbc[..., self.dt_rank: self.dt_rank + self.d_state]
         Cmat = dbc[..., self.dt_rank + self.d_state:]
-        delta = torch.nn.functional.softplus(self.dt_proj(dt))   # [B, K, d_inner]
-        A = -torch.exp(self.A_log)                               # [d_inner, d_state]
-
-        # selective recurrent scan over K slots (constant memory)
+        delta = torch.nn.functional.softplus(self.dt_proj(dt))
+        A = -torch.exp(self.A_log)
         hstate = torch.zeros(B_, self.d_inner, self.d_state,
                              device=x.device, dtype=x.dtype)
         ys = []
         for t in range(K):
-            d_t = delta[:, t].unsqueeze(-1)        # [B, d_inner, 1]
+            d_t = delta[:, t].unsqueeze(-1)
             hstate = torch.exp(d_t * A) * hstate + \
                 d_t * Bmat[:, t].unsqueeze(1) * h[:, t].unsqueeze(-1)
-            ys.append((hstate * Cmat[:, t].unsqueeze(1)).sum(-1))  # [B, d_inner]
-        y = torch.stack(ys, dim=1)                 # [B, K, d_inner]
-        y = y + h * self.D                         # skip connection
-        y = y * torch.nn.functional.silu(gate)     # gated output
+            ys.append((hstate * Cmat[:, t].unsqueeze(1)).sum(-1))
+        y = torch.stack(ys, dim=1)
+        y = y + h * self.D
+        y = y * torch.nn.functional.silu(gate)
         return res + self.drop(self.out_proj(y))
 
 
 @register("mamba")
 class SemanticMamba(SemanticCore):
     """Mamba-style selective SSM core, pure PyTorch.
-    Controllable: num_layers (block depth), ssm_d_state, ssm_d_conv, ssm_expand."""
+    Controllable: num_layers, ssm_d_state, ssm_d_conv, ssm_expand."""
 
     def __init__(self, d_model: int, num_semantic_tokens: int, num_layers: int = 2,
                  ssm_d_state: int = 16, ssm_d_conv: int = 4, ssm_expand: float = 2.0,
@@ -262,17 +379,13 @@ class SemanticMamba(SemanticCore):
 # -------------------------------------------------------------------- Diffusion
 @register("diffusion")
 class SemanticDiffusion(SemanticCore):
-    """Diffusion-inspired iterative refinement core.
-
-    Honest scope: the Semantic Core contract is a DETERMINISTIC map z->z, so
-    this is not a stochastic DDPM sampler. Training samples a timestep t,
-    noises the input (sqrt(alpha_bar_t) z + sqrt(1-alpha_bar_t) eps) and learns
-    a t-conditioned denoiser whose output the Stage-2 loss pulls toward the
-    target semantics. Evaluation runs `diffusion_steps` deterministic
-    refinement passes (t = T..1) without noise injection.
-
-    Controllable: diffusion_steps (schedule length / eval passes), num_layers,
-    num_heads, ffn_dim, diffusion_schedule (cosine|linear)."""
+    """Diffusion-inspired iterative refinement core (deterministic z->z map;
+    NOT a stochastic DDPM sampler). Training: sample timestep t, noise the
+    input, learn a t-conditioned denoiser. Eval: `diffusion_steps`
+    deterministic refinement passes. Zip-B adds forward_with_state with an
+    encoder-conditioned mode (cond = context encoder states).
+    Controllable: diffusion_steps, num_layers, num_heads, ffn_dim,
+    diffusion_schedule (cosine|linear)."""
 
     def __init__(self, d_model: int, num_semantic_tokens: int, num_layers: int = 2,
                  num_heads: int = 8, ffn_dim: int = 2048, dropout: float = 0.1,
@@ -296,8 +409,7 @@ class SemanticDiffusion(SemanticCore):
         self.norm = nn.LayerNorm(d_model)
 
     def _step(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """One denoising step; t: [B] int in 1..T. Residual parameterization."""
-        h = x + self.temb(t).unsqueeze(1)          # broadcast timestep embedding
+        h = x + self.temb(t).unsqueeze(1)
         return x + self.denoiser(h)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
@@ -308,7 +420,6 @@ class SemanticDiffusion(SemanticCore):
             eps = torch.randn_like(z)
             x_t = abar.sqrt() * z + (1 - abar).sqrt() * eps
             return self.norm(self._step(x_t, t))
-        # eval: deterministic reverse refinement t = T..1 (no noise)
         x = z
         for t in range(self.T, 0, -1):
             tt = torch.full((z.size(0),), t, dtype=torch.long, device=z.device)
@@ -328,7 +439,7 @@ class IdentityCore(SemanticCore):
 
 @register("random")
 class RandomCore(SemanticCore):
-    """Frozen random projection -- a destructive-control baseline for ablation."""
+    """Frozen random projection -- a destructive-control baseline."""
 
     def __init__(self, d_model: int, num_semantic_tokens: int, seed: int = 1234,
                  **kw) -> None:
@@ -347,9 +458,8 @@ def available_cores():
 
 def build_semantic_core(cfg, d_model=None, num_semantic_tokens=None) -> SemanticCore:
     """Factory from a SemanticCoreConfig-like object. d_model / K are injected
-    from the MODEL config by callers (kept out of the core's own YAML section).
-    All core knobs are read with getattr + default, so old YAML files (and old
-    checkpoints' saved configs) keep working unchanged."""
+    from the MODEL config by callers. All knobs are read with getattr +
+    default, so old YAML files and old checkpoints keep working."""
     cls = _REGISTRY.get(cfg.type)
     if cls is None:
         raise KeyError(f"Unknown semantic core type '{cfg.type}'. "
@@ -372,6 +482,7 @@ def build_semantic_core(cfg, d_model=None, num_semantic_tokens=None) -> Semantic
         ssm_expand=getattr(cfg, "ssm_expand", 2.0),
         hopfield_beta=getattr(cfg, "hopfield_beta", 1.0),
         hopfield_steps=getattr(cfg, "hopfield_steps", 3),
+        bi_detach_state=getattr(cfg, "bi_detach_state", True),
         diffusion_steps=getattr(cfg, "diffusion_steps", 4),
         diffusion_schedule=getattr(cfg, "diffusion_schedule", "cosine"),
         seed=getattr(cfg, "seed", 1234),

@@ -140,3 +140,28 @@ eval:
 
 CLI 覆盖：`--eval-preset english|chinese|custom`、`--custom-tests file.json`。
 注意 probe 词表要与语料语言匹配，否则 subject/object probe 为 0。
+
+## v2 Cores: BiHopfield（持久状态重做）+ global_mlp
+
+- **bihopfield 重做为真正的 persistent-state 神经动力学 core**（非 attention mixer）：
+  - 持久状态 `S: [B, depth, K, D]` **跨调用保持**——多轮上下文活在这个状态里，
+    而不是拼进 prompt。调用方（trainer / generator）显式携带并回传状态。
+  - `hopfield_steps` 个离散 tick：每次调用内部演化 steps 步，每 tick 读取当前
+    状态产生下一状态（动力学过程，不是一次前向）。
+  - 混合用**双轴全连接 MLP**（无 attention）：token 轴（K×K，每个 slot 读所有
+    slot）+ depth 轴（depth×depth，状态切片交互）+ 逐 token MLP（D→2D→D）。
+  - tick embedding + depth embedding、pre-LayerNorm、**gated delta** 更新
+    `S ← S + g ⊙ Δ`。
+  - collapse 诊断：每次调用后 `core.last_diag` 记录 state 的 batch 方差与平均
+    成对 cosine（TensorBoard: `core_state/*`）。
+  - `core.bi_detach_state`：true = 调用间 detach（截断动力学），false = 跨 tick BPTT。
+  - 兼容性说明：参数名变更，**旧 bihopfield checkpoint 不兼容**（已作废重训）。
+- **global_mlp（新）**：`[B,K,D]` 展平为 `[B,K*D]` 过深层全连接 MLP，中间每层
+  把全部 token 与全部维度互相连接。注意参数量 ~ (K·D)² 量级：K=32/D=512/
+  hidden=2048/depth=8 时约 96M 参数。
+- 其余 core（mlp/transformer/conv/mamba/diffusion/identity/random）保持不变。
+
+```bash
+python train_stage2.py --stage1-checkpoint checkpoints/stage1/best.pt --core bihopfield
+python train_stage2.py --stage1-checkpoint checkpoints/stage1/best.pt --core global_mlp
+```

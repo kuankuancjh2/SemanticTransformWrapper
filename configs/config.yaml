@@ -1,5 +1,5 @@
 model:
-  vocab_size: 16000
+  vocab_size: 276
   max_seq_len: 256
   hidden_dim: 512
   num_heads: 8
@@ -31,6 +31,7 @@ core:
   ssm_expand: 2.0
   hopfield_beta: 1.0
   hopfield_steps: 20
+  bi_detach_state: true
   diffusion_steps: 4
   diffusion_schedule: cosine
   seed: 1234
