@@ -16,8 +16,8 @@ bottleneck:
   use_noise_train: true
   use_queries: true
 core:
-  type: bihopfield
-  num_layers: 8
+  type: global_mlp
+  num_layers: 6
   num_heads: 8
   ffn_dim: 2048
   dropout: 0.1
