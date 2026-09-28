@@ -34,6 +34,7 @@ core:
   hopfield_steps: 3
   diffusion_steps: 3
   diffusion_schedule: cosine
+  diffusion_conditioned: false  # true = context encoder output conditions denoising (latent-memory mode)
   seed: 1234
 vae:
   enabled: false
@@ -95,3 +96,9 @@ gen:
   temperature: 0.7
   top_p: 0.9
   greedy: true
+
+stage3:
+  lr: 0.0001            # end-to-end: lower than stage 1/2
+  epochs: 10
+  max_steps: null
+  warmup_steps: 200

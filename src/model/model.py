@@ -1,14 +1,18 @@
-"""Top-level model assemblies.
+"""Top-level model assemblies (Zip-B).
 
 Stage1Model: Language Autoencoder (Encoder -> Bottleneck -> AR Decoder).
-Stage2Model: frozen Stage-1 parts + one pluggable SemanticCore.
+Stage2Model: encoder + bottleneck + core + decoder, with a `frozen` flag:
+  frozen=True  -> Stage 2 (Stage-1 parts frozen, only the core trains;
+                  decode-loss gradients flow THROUGH the frozen decoder)
+  frozen=False -> Stage 3 (EVERYTHING trains end-to-end)
 
-The semantic interface is fixed at [B, K, D] end to end. DECODER_SEES_PROMPT
-(default False) is the only ablation switch on the decoder side.
+The semantic interface is fixed at [B, K, D]. VAE mode (config.vae.enabled)
+adds mu/logvar heads inside the bottleneck; eval/inference use the
+deterministic mu.
 """
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -65,11 +69,7 @@ class Stage1Model(nn.Module):
     def forward(self, prompt_ids: torch.Tensor, prompt_mask: torch.Tensor,
                 tgt_in: torch.Tensor, tgt_mask: torch.Tensor,
                 noise_std: float | None = None) -> dict:
-        """Teacher-forced pass. tgt_in starts with BOS, no EOS (labels = shifted).
-
-        VAE mode additionally returns 'mu' / 'logvar' for the KL term
-        (both None when the VAE is disabled).
-        """
+        """Teacher-forced pass. VAE mode also returns mu/logvar (KL term)."""
         enc = self.encoder(prompt_ids, prompt_mask)
         if self.bottleneck.use_vae:
             z, mu, logvar = self.bottleneck(enc, prompt_mask, noise_std=noise_std,
@@ -86,36 +86,55 @@ class Stage1Model(nn.Module):
 
 
 class Stage2Model(nn.Module):
-    """Frozen (encoder, bottleneck, decoder) + trainable SemanticCore."""
+    """Stage-2 (frozen=True, default) or Stage-3 (frozen=False, end-to-end)
+    wrapper around (encoder, bottleneck, core, decoder)."""
 
-    def __init__(self, stage1: Stage1Model, core: nn.Module) -> None:
+    def __init__(self, stage1: Stage1Model, core: nn.Module,
+                 frozen: bool = True) -> None:
         super().__init__()
         self.cfg = stage1.cfg
+        self.frozen = frozen
         self.encoder = stage1.encoder
         self.bottleneck = stage1.bottleneck
         self.decoder = stage1.decoder
         self.core = core
-        for mod in (self.encoder, self.bottleneck, self.decoder):
-            mod.eval()
-            mod.requires_grad_(False)
+        if frozen:
+            for mod in (self.encoder, self.bottleneck, self.decoder):
+                mod.eval()
+                mod.requires_grad_(False)
 
     def train(self, mode: bool = True) -> "Stage2Model":
         super().train(mode)
-        if mode:  # frozen modules stay in eval mode
+        if mode and self.frozen:  # frozen modules stay in eval mode
             self.encoder.eval()
             self.bottleneck.eval()
             self.decoder.eval()
         return self
 
-    @torch.no_grad()
-    def encode_prompt(self, ids: torch.Tensor, padding_mask: torch.Tensor,
-                      apply_noise: bool = False) -> torch.Tensor:
-        enc = self.encoder(ids, padding_mask)
-        return self.bottleneck(enc, padding_mask, apply_noise=apply_noise)
+    def _grad_ctx(self):
+        """no_grad only when the parts are frozen (Stage 2). Stage 3 keeps the
+        graph through encoder AND core."""
+        import contextlib
+        return contextlib.nullcontext() if not self.frozen else torch.no_grad()
 
     @torch.no_grad()
     def encode_target(self, ids: torch.Tensor, padding_mask: torch.Tensor) -> torch.Tensor:
-        return self.encode_prompt(ids, padding_mask, apply_noise=False)
+        enc = self.encoder(ids, padding_mask)
+        return self.bottleneck(enc, padding_mask, apply_noise=False)
+
+    def encode_prompt(self, ids: torch.Tensor, padding_mask: torch.Tensor,
+                      apply_noise: bool = False) -> torch.Tensor:
+        with self._grad_ctx():
+            enc = self.encoder(ids, padding_mask)
+            z = self.bottleneck(enc, padding_mask, apply_noise=apply_noise)
+        return z
+
+    def encode_prompt_full(self, ids: torch.Tensor, padding_mask: torch.Tensor):
+        """Returns (latent [B, K, D], encoder_states [B, T, D])."""
+        with self._grad_ctx():
+            enc = self.encoder(ids, padding_mask)
+            z = self.bottleneck(enc, padding_mask, apply_noise=False)
+        return z, enc
 
     def transform(self, z_prompt: torch.Tensor) -> torch.Tensor:
         return self.core(z_prompt)
@@ -124,7 +143,6 @@ class Stage2Model(nn.Module):
                       tgt_padding_mask: Optional[torch.Tensor] = None,
                       prompt_states: Optional[torch.Tensor] = None,
                       prompt_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # grads flow through the frozen decoder back into the core
         return self.decoder(tgt_in, semantic_tokens, tgt_padding_mask)
 
     def forward(self, prompt_ids: torch.Tensor, prompt_mask: torch.Tensor,

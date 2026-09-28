@@ -21,17 +21,17 @@ import torch.nn.functional as F
 
 from src.checkpoints import build_stage1_from_checkpoint, build_stage2_from_checkpoint
 from src.config import resolve_device
-from src.data import load_split
+from src.data import format_conversation, load_messages
 from src.utils.logging_utils import setup_logging
 
 OUT_DIR = Path("latent_vis")
 
 
-def get_latents(model, tok, triples, device, max_items=256):
+def get_latents(model, tok, triples, device, max_items=256, max_len=126):
     zs, texts = [], []
     with torch.no_grad():
         for p, t, _ in triples[:max_items]:
-            ids = [tok.bos_id] + tok.encode(t, max_len=126)
+            ids = [tok.bos_id] + tok.encode(t, max_len=max_len)
             x = torch.tensor([ids], dtype=torch.long, device=device)
             m = torch.ones_like(x, dtype=torch.bool)
             if hasattr(model, "encode_prompt"):
@@ -54,13 +54,18 @@ def main() -> None:
     OUT_DIR.mkdir(exist_ok=True)
     device = resolve_device(args.device)
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    if ckpt.get("stage") == 2:
+    if ckpt.get("stage") in (2, 3):
         model, cfg, tok = build_stage2_from_checkpoint(ckpt, device)
     else:
         model, cfg, tok = build_stage1_from_checkpoint(ckpt, device)
 
-    triples = load_split(Path(cfg.data.processed_dir) / "val.jsonl")
-    Z, texts = get_latents(model, tok, triples, device, args.max_items)
+    convos = load_messages(Path(cfg.data.processed_dir) / "val.jsonl")
+    triples = [(format_conversation(c["messages"]),
+                next((m["content"] for m in reversed(c["messages"])
+                      if m["role"] == "assistant"), ""), "conv")
+               for c in convos]
+    Z, texts = get_latents(model, tok, triples, device, args.max_items,
+                           max_len=cfg.data.max_seq_len)
     X = Z.numpy()
     Zn = F.normalize(Z, dim=-1)
 

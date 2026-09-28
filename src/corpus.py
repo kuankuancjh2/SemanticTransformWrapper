@@ -1,146 +1,169 @@
-"""Corpus acquisition.
+"""Corpus acquisition (Zip-B: STANDARD MESSAGES FORMAT).
 
 Order of preference:
-1. HuggingFace dataset (only when online and --hf-dataset given).
+1. HuggingFace dataset (only when online and --hf-dataset given): each example
+   becomes a single-turn conversation {user: prompt, assistant: target}.
 2. Bundled offline corpus (always available, zero network).
 
-The bundled corpus is a template-generated set of Chinese sentence pairs
-(narrative / paraphrase / QA). It is intentionally structured so that the
-semantic tests (paraphrase consistency, subject/object swap) have real
-ground truth, while remaining fully synthetic and license-free.
+The bundled corpus generates multi-turn conversations in the standard
+messages format:
+
+    {"messages": [{"role": "user", "content": ...},
+                  {"role": "assistant", "content": ...}, ...]}
+
+- 1-3 exchanges per conversation (user/assistant pairs).
+- The LAST assistant turn is the training target for Stage 2/3; everything
+  before it is context (history turns update latent-memory core states; the
+  final user turn is the stimulus prompt).
+- Stage 1 uses single-turn reconstruction only: individual utterances
+  (+ the dedicated paraphrase pairs, kept for the consistency loss).
 """
 from __future__ import annotations
 
 import random
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
-SUBJECTS = ["小明", "小红", "老师", "妈妈", "爷爷", "姐姐", "男孩", "女孩", "医生", "猫"]
-OBJECTS = ["苹果", "香蕉", "汽车", "书", "水杯", "面包", "钥匙", "花", "手机", "球"]
-PLACES = ["学校", "家里", "公园", "商店", "图书馆", "厨房", "操场", "教室", "医院", "车上"]
-ACTIONS = ["拿起", "放下", "买到", "找到", "丢掉了", "看着", "带来了", "洗干净了"]
-TIME_WORDS = ["今天早上", "昨天下午", "刚才", "今天", "昨天", "上次"]
-FEELINGS = ["很开心", "很紧张", "很平静", "有点累", "非常激动", "很满足"]
-TOPICS = ["音乐", "科学", "历史", "运动", "旅行", "食物", "天气", "学习", "艺术", "科技"]
+SUBJECTS = ["Alice", "Bob", "Tom", "Mary", "Mom", "Dad", "the boy", "the girl"]
+OBJECTS = ["apple", "banana", "car", "book", "cup", "bread", "key", "flower"]
+PLACES = ["school", "home", "the park", "the shop", "the library", "the kitchen"]
+ACTIONS = ["picked up", "put down", "bought", "found", "lost", "looked at",
+           "brought", "washed"]
+TIME_WORDS = ["This morning", "Yesterday afternoon", "Just now", "Today",
+              "Yesterday", "Last time"]
+FEELINGS = ["very happy", "nervous", "calm", "a bit tired", "excited", "satisfied"]
+TOPICS = ["music", "science", "history", "sports", "travel", "food", "weather",
+          "learning", "art", "technology"]
 
 CAUSE_TEMPLATES = [
-    "因为{topic}很有趣，{subj}每天都花时间研究",
-    "{subj}喜欢{topic}，所以心情{feeling}",
-    "由于{topic}很吸引人，{subj}忘记了时间",
+    "Because {topic} is interesting, {subj} spends time on it every day",
+    "{subj} likes {topic}, so he feels {feeling}",
+    "Since {topic} is fascinating, {subj} forgot the time",
 ]
 CONT_TEMPLATES = [
-    "{time}，{subj}在{place}{action}{obj}，然后{feeling}地笑了",
-    "{time}{subj}{action}{obj}，心里{feeling}",
-    "{subj}在{place}，{action}一个{obj}，感觉{feeling}",
+    "{time}, {subj} {action} the {obj} at {place}, and then smiled, feeling {feeling}",
+    "{time} {subj} {action} a {obj} and felt {feeling}",
+    "{subj} was at {place}, {action} a {obj}, and it felt {feeling}",
 ]
 COND_TEMPLATES = [
-    "如果一个{obj}从桌子上掉下来，那么它可能会摔坏",
-    "如果明天下雨，{subj}就留在{place}里",
-    "要是{subj}能早点起床，就不会迟到",
+    "If a {obj} falls off the table, it might break",
+    "If it rains tomorrow, {subj} will stay at {place}",
+    "If {subj} could get up earlier, he would not be late",
 ]
 PARAPHRASE_PAIRS = [
-    ("小明吃了一个苹果。", "一个苹果被小明吃掉了。"),
-    ("小红买了一辆汽车。", "一辆汽车被小红买回来了。"),
-    ("老师正在批改作业。", "作业正被老师批改着。"),
-    ("猫在追一只鸟。", "一只鸟被猫追着。"),
-    ("爷爷在花园里浇水。", "花园里的花被爷爷浇了水。"),
-    ("妈妈做了晚饭。", "晚饭被妈妈做好了。"),
-    ("他把信寄了出去。", "那封信被他寄了出去。"),
-    ("我们完成了这个项目。", "这个项目被我们完成了。"),
+    ("Alice ate an apple.", "An apple was eaten by Alice."),
+    ("Bob bought a car.", "A car was bought by Bob."),
+    ("The teacher is grading homework.", "The homework is being graded by the teacher."),
+    ("The cat is chasing a bird.", "A bird is being chased by the cat."),
+    ("Grandpa is watering the garden.", "The garden is being watered by Grandpa."),
+    ("Mom cooked dinner.", "Dinner was cooked by Mom."),
+    ("He sent the letter out.", "The letter was sent out by him."),
+    ("We finished this project.", "This project was finished by us."),
 ]
 QA_PAIRS = [
-    ("苹果有什么营养？", "苹果含有膳食纤维、维生素和多种抗氧化物质。"),
-    ("为什么天空是蓝色的？", "因为大气分子对短波长的蓝光散射更强。"),
-    ("猫为什么喜欢晒太阳？", "晒太阳可以帮助猫保持体温并且感到放松。"),
-    ("人为什么要睡觉？", "睡眠帮助大脑清理代谢废物并巩固记忆。"),
-    ("水在多少度沸腾？", "在标准大气压下，水在一百度沸腾。"),
-    ("怎样学好一门语言？", "坚持每天练习听说读写，并且大量接触真实的语言材料。"),
+    ("What nutrition does an apple have?",
+     "An apple contains dietary fiber, vitamins and many antioxidants."),
+    ("Why is the sky blue?",
+     "Because air molecules scatter short-wavelength blue light more strongly."),
+    ("Why do cats like sunbathing?",
+     "Sunbathing helps cats keep warm and feel relaxed."),
+    ("Why do people sleep?",
+     "Sleep helps the brain clear metabolic waste and consolidate memories."),
+    ("At what temperature does water boil?",
+     "At standard atmospheric pressure, water boils at one hundred degrees."),
+    ("How to learn a language well?",
+     "Practice listening, speaking, reading and writing every day, and read a lot."),
 ]
 
 OPENER_PREFIX = [
-    "今天天气很好，我决定",
-    "人工智能最重要的问题之一是",
-    "我喜欢音乐，因为",
-    "回想起那一天，",
-    "站在窗边，他忽然想到",
+    "The weather today is good, I decided",
+    "One of the most important questions about AI is",
+    "I like music because",
+    "Remembering that day,",
+    "Standing by the window, he suddenly thought",
 ]
 
 
 def _fill(template: str, rng: random.Random) -> str:
     return template.format(
-        subj=rng.choice(SUBJECTS),
-        obj=rng.choice(OBJECTS),
-        place=rng.choice(PLACES),
-        action=rng.choice(ACTIONS),
-        time=rng.choice(TIME_WORDS),
-        feeling=rng.choice(FEELINGS),
-        topic=rng.choice(TOPICS),
-    )
+        subj=rng.choice(SUBJECTS), obj=rng.choice(OBJECTS),
+        place=rng.choice(PLACES), action=rng.choice(ACTIONS),
+        time=rng.choice(TIME_WORDS), feeling=rng.choice(FEELINGS),
+        topic=rng.choice(TOPICS))
 
 
-def build_bundled_corpus(num_samples: int = 6000, seed: int = 42) -> Dict[str, List[Tuple[str, str, str]]]:
-    """Return {'train': [(prompt, target), ...], 'val': [...], 'test': [...]}.
+def _sentence(rng: random.Random) -> str:
+    r = rng.random()
+    if r < 0.45:
+        return _fill(rng.choice(CONT_TEMPLATES), rng)
+    if r < 0.75:
+        return _fill(rng.choice(CAUSE_TEMPLATES), rng) + "."
+    if r < 0.9:
+        return _fill(rng.choice(COND_TEMPLATES), rng)
+    return rng.choice(QA_PAIRS)[1]
 
-    Each sample is a (prompt, target, ptype) triple. For most samples the target is a
-    natural continuation (prompt == a prefix of the target, which is exactly
-    the Stage-1 autoencoding + Stage-2 semantic-continuation setup).
+
+def _user_turn(rng: random.Random) -> str:
+    r = rng.random()
+    if r < 0.4:
+        return rng.choice(QA_PAIRS)[0]
+    if r < 0.7:
+        return rng.choice(OPENER_PREFIX)
+    s = _sentence(rng)
+    return s[: max(2, len(s) // 2)]  # a statement stem the assistant completes
+
+
+def _assistant_turn(rng: random.Random) -> str:
+    r = rng.random()
+    if r < 0.35:
+        return rng.choice(QA_PAIRS)[1]
+    if r < 0.6:
+        p = rng.choice(OPENER_PREFIX)
+        return p + _sentence(rng)
+    return _sentence(rng) + ("." if not _sentence(rng).endswith(".") else "")
+
+
+def build_bundled_corpus(num_convos: int = 4000, seed: int = 42
+                         ) -> Dict[str, List[Dict]]:
+    """Return {'train'/'val'/'test': [ {"messages": [...]}, ... ]}.
+
+    Conversation shapes:
+      - single exchange: user question/opener/statement -> assistant answer
+      - 2-3 exchanges: multi-turn; later user turns reference nothing external,
+        so context modeling is purely about the dialogue history
+      - paraphrase convos: user = A, assistant = B (paraphrase pair)
     """
     rng = random.Random(seed)
-
-    def one_sentence() -> str:
-        kind = rng.random()
-        if kind < 0.4:
-            return _fill(rng.choice(CONT_TEMPLATES), rng) + "。"
-        if kind < 0.7:
-            return _fill(rng.choice(CAUSE_TEMPLATES), rng) + "。"
-        if kind < 0.85:
-            return _fill(rng.choice(COND_TEMPLATES), rng)
-        return rng.choice(QA_PAIRS)[1]
-
-    def continuation() -> Tuple[str, str]:
-        s = one_sentence()
-        # cut a prompt prefix at a character boundary, target completes it
-        cut = max(2, len(s) // 2)
-        cut += rng.randint(0, 2)
-        cut = min(cut, len(s) - 1)
-        prompt, target = s[:cut], s
-        return prompt, target
-
-    def paraphrase_pair() -> Tuple[str, str]:
-        return rng.choice(PARAPHRASE_PAIRS)
-
-    def qa() -> Tuple[str, str]:
-        return rng.choice(QA_PAIRS)
-
-    def opener() -> Tuple[str, str]:
-        p = rng.choice(OPENER_PREFIX)
-        t = p + one_sentence()
-        return p, t
-
-    samples: List[Tuple[str, str, str]] = []
-    n = num_samples
-    for _ in range(n):
+    convos: List[Dict] = []
+    for _ in range(num_convos):
         r = rng.random()
-        if r < 0.55:
-            samples.append((*continuation(), "cont"))
-        elif r < 0.70:
-            samples.append((*paraphrase_pair(), "para"))
-        elif r < 0.85:
-            samples.append((*qa(), "qa"))
-        else:
-            samples.append((*opener(), "open"))
-    # dedup while keeping order
+        if r < 0.10:  # paraphrase single-turn
+            a, b = rng.choice(PARAPHRASE_PAIRS)
+            convos.append({"messages": [{"role": "user", "content": a},
+                                        {"role": "assistant", "content": b}]})
+        elif r < 0.55:  # single exchange
+            convos.append({"messages": [
+                {"role": "user", "content": _user_turn(rng)},
+                {"role": "assistant", "content": _assistant_turn(rng)}]})
+        else:  # multi-turn: 2-3 exchanges
+            n = rng.choice([2, 2, 3])
+            msgs = []
+            for i in range(n):
+                u = _user_turn(rng) if i > 0 or rng.random() < 0.5 else \
+                    rng.choice(QA_PAIRS)[0]
+                a = _assistant_turn(rng)
+                msgs.append({"role": "user", "content": u})
+                msgs.append({"role": "assistant", "content": a})
+            convos.append({"messages": msgs})
     seen, uniq = set(), []
-    for s in samples:
-        if s not in seen:
-            seen.add(s)
-            uniq.append(s)
-
+    for c in convos:
+        key = tuple((m["role"], m["content"]) for m in c["messages"])
+        if key not in seen:
+            seen.add(key)
+            uniq.append(c)
     rng.shuffle(uniq)
     total = len(uniq)
     n_val = max(1, int(total * 0.1))
     n_test = max(1, int(total * 0.1))
-    return {
-        "train": uniq[: total - n_val - n_test],
-        "val": uniq[total - n_val - n_test : total - n_test],
-        "test": uniq[total - n_test :],
-    }
+    return {"train": uniq[: total - n_val - n_test],
+            "val": uniq[total - n_val - n_test: total - n_test],
+            "test": uniq[total - n_test:]}

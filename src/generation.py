@@ -11,6 +11,8 @@ from typing import List, Optional
 import torch
 import torch.nn.functional as F
 
+from .model.cores import core_forward
+
 
 @torch.no_grad()
 def sample_next(logits: torch.Tensor, temperature: float, top_p: float,
@@ -43,7 +45,14 @@ class Generator:
         ids = [self.tok.bos_id] + self.tok.encode(prompt, max_len=self.max_seq_len - 2)
         x = torch.tensor([ids], dtype=torch.long, device=self.device)
         mask = torch.ones_like(x, dtype=torch.bool)
-        if hasattr(self.model, "encode_prompt"):  # Stage2Model
+        if hasattr(self.model, "encode_prompt_full"):  # Stage2/3 wrapper
+            z, enc = self.model.encode_prompt_full(x, mask)
+            core = self.model.core
+            if getattr(core, "accepts_cond", False):  # conditioned diffusion
+                z, _ = core_forward(core, z, cond=enc)
+            else:  # memory cores: single-shot generation starts a fresh state
+                z, _ = core_forward(core, z)
+        elif hasattr(self.model, "encode_prompt"):
             z = self.model.encode_prompt(x, mask, apply_noise=apply_noise)
             z = self.model.transform(z)  # SemanticCore, once
         else:  # Stage1Model

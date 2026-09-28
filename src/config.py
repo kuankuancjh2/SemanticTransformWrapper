@@ -79,7 +79,20 @@ class SemanticCoreConfig:
     # Diffusion core controls
     diffusion_steps: int = 4
     diffusion_schedule: str = "cosine"  # cosine | linear
+    diffusion_conditioned: bool = False  # true = context encoder states condition the denoising
     seed: int = 1234  # for the random core
+
+
+@dataclass
+class Stage3Config:
+    """End-to-end training (prompt -> target, all modules unfrozen).
+    Lower default LR than Stage 1/2; gradient clipping + warmup come from
+    train.grad_clip / this warmup; auxiliary encoder losses are retained with
+    the Stage-1 loss weights."""
+    lr: float = 1e-4
+    epochs: int = 10
+    max_steps: Optional[int] = None
+    warmup_steps: int = 200
 
 
 @dataclass
@@ -200,6 +213,7 @@ class Config:
     loss: LossConfig = field(default_factory=LossConfig)
     data: DataConfig = field(default_factory=DataConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
+    stage3: Stage3Config = field(default_factory=Stage3Config)
     gen: GenerationConfig = field(default_factory=GenerationConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
 
@@ -216,7 +230,7 @@ class Config:
     def from_dict(cls, d: Dict[str, Any]) -> "Config":
         cfg = cls()
         for sect in ("model", "bottleneck", "core", "vae", "loss", "data", "train",
-                     "gen", "eval"):
+                     "stage3", "gen", "eval"):
             if sect in d and d[sect]:
                 sub = getattr(cfg, sect)
                 valid = {f.name for f in dataclasses.fields(sub)}

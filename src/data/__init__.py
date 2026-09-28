@@ -1,7 +1,10 @@
-# Re-export data utilities. corpus.py / dataset.py live at src/ top level;
-# this package exposes them under src.data for cleaner imports.
+# Re-export data utilities (Zip-B: messages format + stage-1 pairs).
 from ..corpus import build_bundled_corpus
-from ..dataset import (TextPairDataset, collate_pairs, load_split, save_split)
+from ..dataset import (MessagesDataset, TextPairDataset, collate_messages,
+                       collate_pairs, format_conversation, load_messages,
+                       load_pairs, save_messages, save_pairs, utterances_of)
 
-__all__ = ["build_bundled_corpus", "TextPairDataset", "collate_pairs",
-           "load_split", "save_split"]
+__all__ = ["build_bundled_corpus", "MessagesDataset", "TextPairDataset",
+           "collate_messages", "collate_pairs", "format_conversation",
+           "load_messages", "load_pairs", "save_messages", "save_pairs",
+           "utterances_of"]

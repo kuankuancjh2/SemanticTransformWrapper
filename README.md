@@ -141,27 +141,45 @@ eval:
 CLI 覆盖：`--eval-preset english|chinese|custom`、`--custom-tests file.json`。
 注意 probe 词表要与语料语言匹配，否则 subject/object probe 为 0。
 
-## v2 Cores: BiHopfield（持久状态重做）+ global_mlp
+## v2: Messages 数据 + 潜空间记忆 + Stage 3（端到端）
 
-- **bihopfield 重做为真正的 persistent-state 神经动力学 core**（非 attention mixer）：
-  - 持久状态 `S: [B, depth, K, D]` **跨调用保持**——多轮上下文活在这个状态里，
-    而不是拼进 prompt。调用方（trainer / generator）显式携带并回传状态。
-  - `hopfield_steps` 个离散 tick：每次调用内部演化 steps 步，每 tick 读取当前
-    状态产生下一状态（动力学过程，不是一次前向）。
-  - 混合用**双轴全连接 MLP**（无 attention）：token 轴（K×K，每个 slot 读所有
-    slot）+ depth 轴（depth×depth，状态切片交互）+ 逐 token MLP（D→2D→D）。
-  - tick embedding + depth embedding、pre-LayerNorm、**gated delta** 更新
-    `S ← S + g ⊙ Δ`。
-  - collapse 诊断：每次调用后 `core.last_diag` 记录 state 的 batch 方差与平均
-    成对 cosine（TensorBoard: `core_state/*`）。
-  - `core.bi_detach_state`：true = 调用间 detach（截断动力学），false = 跨 tick BPTT。
-  - 兼容性说明：参数名变更，**旧 bihopfield checkpoint 不兼容**（已作废重训）。
-- **global_mlp（新）**：`[B,K,D]` 展平为 `[B,K*D]` 过深层全连接 MLP，中间每层
-  把全部 token 与全部维度互相连接。注意参数量 ~ (K·D)² 量级：K=32/D=512/
-  hidden=2048/depth=8 时约 96M 参数。
-- 其余 core（mlp/transformer/conv/mamba/diffusion/identity/random）保持不变。
+### 1. 数据 = 标准 messages 格式
+`data/processed/{train,val,test}.jsonl` 每行一个对话：
+```json
+{"messages": [{"role": "user", "content": "..."},
+              {"role": "assistant", "content": "..."}, ...]}
+```
+- **Stage 1 只做单对单重构**：`stage1_train.jsonl` 是逐句 `(utterance, utterance)`
+  对 + 释义对，不再有任何多轮重构。
+- Stage 2/3 读对话：最后一条 assistant = target；最后一条 user = 刺激 prompt；
+  之前的轮次 = 上下文。
 
+### 2. Stage 2：上下文路由（由 core 能力决定，不靠散落开关）
+| core | 模式 | 上下文去向 |
+|---|---|---|
+| `bihopfield` | 潜空间记忆 | 逐轮编码 → 逐轮 ingest 进持久状态 [B,depth,K,D]（=等效上下文）；刺激 = 最后一条 user 的 latent |
+| `diffusion` + `core.diffusion_conditioned: true` | 条件扩散 | 条件 = 整段对话的 encoder 输出，对 latent 去噪；无持久状态 |
+| 其他全部（含 `diffusion_conditioned: false` 的普通 diffusion） | 拼接 | 整段对话文本正常拼接送入 encoder |
+
+（另有 `identity` 作对照。）
+
+### 3. Stage 3：端到端
 ```bash
-python train_stage2.py --stage1-checkpoint checkpoints/stage1/best.pt --core bihopfield
-python train_stage2.py --stage1-checkpoint checkpoints/stage1/best.pt --core global_mlp
+python train_stage3.py --stage1-checkpoint checkpoints/stage1/best.pt --core transformer
+```
+prompt → Encoder → Bottleneck → Core → AR Decoder → target，全部解冻，
+梯度 decoder→core→encoder 回传。稳定性：`stage3.lr=1e-4`（更低默认 lr）、
+`stage3.warmup_steps` + cosine、grad clip + TensorBoard `gradient_norm`、
+保留 encoder 辅助损失（variance/covariance + VAE KL）、latent 对齐项
+（core 输出 vs target 文本的 encoder latent）。
+
+### 4. 新配置键
+```yaml
+core:
+  diffusion_conditioned: false  # true = 条件扩散（潜空间记忆模式）
+  bi_detach_state: true         # bihopfield 调用间 detach（false = BPTT）
+stage3:
+  lr: 0.0001
+  epochs: 10
+  warmup_steps: 200
 ```

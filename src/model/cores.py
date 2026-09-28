@@ -154,6 +154,7 @@ class SemanticBiHopfield(SemanticCore):
     False = BPTT through the whole tick chain)."""
 
     supports_memory = True
+    ingests_history = True   # context turns update the persistent state
     accepts_cond = False
 
     def __init__(self, d_model: int, num_semantic_tokens: int, num_layers: int = 8,
@@ -385,12 +386,16 @@ class SemanticDiffusion(SemanticCore):
     deterministic refinement passes. Zip-B adds forward_with_state with an
     encoder-conditioned mode (cond = context encoder states).
     Controllable: diffusion_steps, num_layers, num_heads, ffn_dim,
-    diffusion_schedule (cosine|linear)."""
+    diffusion_schedule (cosine|linear), diffusion_conditioned."""
+
+    supports_memory = True      # forward_with_state(cond=...) exists
+    ingests_history = False     # no persistent state of its own
+    accepts_cond = True
 
     def __init__(self, d_model: int, num_semantic_tokens: int, num_layers: int = 2,
                  num_heads: int = 8, ffn_dim: int = 2048, dropout: float = 0.1,
                  diffusion_steps: int = 4, diffusion_schedule: str = "cosine",
-                 **kw) -> None:
+                 diffusion_conditioned: bool = False, **kw) -> None:
         super().__init__()
         self.T = max(1, diffusion_steps)
         if diffusion_schedule == "cosine":
@@ -403,28 +408,52 @@ class SemanticDiffusion(SemanticCore):
             raise KeyError(f"unknown diffusion_schedule '{diffusion_schedule}'")
         self.register_buffer("alpha_bar", torch.clamp(torch.tensor(bar), 1e-4, 1.0))
         self.temb = nn.Embedding(self.T + 1, d_model)
+        # conditioned mode (Zip-B): the encoder result of the CONTEXT acts as a
+        # conditioning signal that steers the denoising of the latent. Two
+        # config-selectable modes:
+        #   diffusion_conditioned=false -> plain core, context is concatenated
+        #       into the encoder input like every other non-memory core
+        #   diffusion_conditioned=true  -> context is encoded SEPARATELY and
+        #       passed as cond [B, T, D]; the latent is denoised under this
+        #       condition (context never touches the encoder input)
+        self.conditioned = diffusion_conditioned
+        if diffusion_conditioned:
+            self.cond_proj = nn.Linear(d_model, d_model)
         layer = nn.TransformerEncoderLayer(
             d_model, num_heads, ffn_dim, dropout, batch_first=True, norm_first=True)
         self.denoiser = nn.TransformerEncoder(layer, max(1, num_layers))
         self.norm = nn.LayerNorm(d_model)
 
-    def _step(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def _step(self, x: torch.Tensor, t: torch.Tensor,
+              cbias: torch.Tensor | None = None) -> torch.Tensor:
         h = x + self.temb(t).unsqueeze(1)
+        if cbias is not None:
+            h = h + cbias
         return x + self.denoiser(h)
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
+    def forward(self, z: torch.Tensor, cond: torch.Tensor | None = None) -> torch.Tensor:
+        cbias = None
+        if self.conditioned and cond is not None:
+            # condition = pooled encoder states of the context -> [B, 1, D]
+            cbias = self.cond_proj(cond.mean(dim=1)).unsqueeze(1)
         if self.training:
             B = z.size(0)
             t = torch.randint(1, self.T + 1, (B,), device=z.device)
             abar = self.alpha_bar[t - 1].view(B, 1, 1)
             eps = torch.randn_like(z)
             x_t = abar.sqrt() * z + (1 - abar).sqrt() * eps
-            return self.norm(self._step(x_t, t))
+            return self.norm(self._step(x_t, t, cbias))
         x = z
         for t in range(self.T, 0, -1):
             tt = torch.full((z.size(0),), t, dtype=torch.long, device=z.device)
-            x = self._step(x, tt)
+            x = self._step(x, tt, cbias)
         return self.norm(x)
+
+    def forward_with_state(self, z: torch.Tensor, state=None,
+                           cond: torch.Tensor | None = None):
+        """Contextured interface used by Stage 2/3: cond = context encoder
+        states. Diffusion carries no persistent state (returns None)."""
+        return self.forward(z, cond=cond), None
 
 
 # -------------------------------------------------------------------- controls
@@ -485,5 +514,6 @@ def build_semantic_core(cfg, d_model=None, num_semantic_tokens=None) -> Semantic
         bi_detach_state=getattr(cfg, "bi_detach_state", True),
         diffusion_steps=getattr(cfg, "diffusion_steps", 4),
         diffusion_schedule=getattr(cfg, "diffusion_schedule", "cosine"),
+        diffusion_conditioned=getattr(cfg, "diffusion_conditioned", False),
         seed=getattr(cfg, "seed", 1234),
     )

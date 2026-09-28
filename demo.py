@@ -33,7 +33,7 @@ def main() -> None:
 
     device = resolve_device(args.device)
     ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
-    if ckpt.get("stage") == 2:
+    if ckpt.get("stage") in (2, 3):
         model, cfg, tok = build_stage2_from_checkpoint(ckpt, device)
         core_name = ckpt.get("core_type", cfg.core.type)
     else:

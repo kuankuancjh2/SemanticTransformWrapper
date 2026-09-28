@@ -28,7 +28,7 @@ def main() -> None:
 
     device = resolve_device(args.device)
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    if ckpt.get("stage") == 2:
+    if ckpt.get("stage") in (2, 3):
         model, cfg, tok = build_stage2_from_checkpoint(ckpt, device)
     else:
         model, cfg, tok = build_stage1_from_checkpoint(ckpt, device)

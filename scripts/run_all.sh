@@ -12,6 +12,8 @@ python train_stage1.py --max-steps "$STEPS" --epochs 100 \
 python train_stage2.py --stage1-checkpoint checkpoints/stage1/best.pt \
     --max-steps "$STEPS" --epochs 100 --num-workers 0 --core transformer
 
+python train_stage3.py --stage1-checkpoint checkpoints/stage1/best.pt
+
 python generate.py --checkpoint checkpoints/stage2/best.pt --prompt "小明今天去了学校"
 python evaluate.py --checkpoint checkpoints/stage2/best.pt --max-probe-items 200
 python inspect_latent.py --checkpoint checkpoints/stage1/best.pt --max-items 128
