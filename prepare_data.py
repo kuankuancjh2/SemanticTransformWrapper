@@ -40,31 +40,92 @@ ROW_BYTES_TOK = 128     # rough bytes/token-sequence for flush sizing
 
 
 # ============================================================== HF parsing
-# (user's multi-format HF parsing, preserved as pure functions)
+# Convert various HF dataset formats into standard:
+#
+# {
+#     "messages": [
+#         {"role": "user", "content": "..."},
+#         {"role": "assistant", "content": "..."},
+#         ...
+#     ]
+# }
+#
+# IMPORTANT:
+#   <speaker1> / <speaker2> are NOT treated as fixed roles.
+#   We determine roles purely by FIRST APPEARANCE:
+#
+#       first speaker occurrence  -> user
+#       second speaker occurrence -> assistant
+#       third speaker occurrence  -> user
+#       fourth speaker occurrence -> assistant
+#
+# This is necessary because some datasets contain examples such as:
+#
+#   {"src": "<speaker2>我以前用过挺好的",
+#    "tgt": "我用的海飞丝也挺好，就是有点贵"}
+#
+# Here speaker2 is the first speaker, so it MUST become user.
+# ==============================================================
+
 _CJK = r"\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
-_CJK_PUNCT = "，。！？；：、（）【】「」『』《》〈〉“”‘’"
+
+_CJK_PUNCT = (
+    "，。！？；：、（）【】「」『』《》〈〉"
+    "“”‘’"
+)
+
 
 def _clean(x) -> str:
+    """Normalize text conservatively.
+
+    The goal is to remove dataset-formatting whitespace without
+    destroying meaningful English/number spaces.
+
+    Examples:
+        "实木 还是 钢管 ， 结实 不"
+            -> "实木还是钢管，结实不"
+
+        "hello world"
+            -> "hello world"
+
+        "RTX 5060"
+            -> "RTX 5060"
+    """
     if x is None:
         return ""
 
-    s = str(x)
+    # Do not stringify dict/list here accidentally.
+    if not isinstance(x, str):
+        x = str(x)
 
-    # 统一各种 Unicode 空白
+    s = x
+
+    # Normalize Unicode whitespace.
     s = re.sub(r"[\u00A0\u2000-\u200B\u3000\t\r\n]+", " ", s)
     s = s.strip()
 
     if not s:
         return ""
 
-    # 中文字符之间的错误空格
+    # ----------------------------------------------------------
+    # Chinese <-> Chinese:
+    # remove spaces that are almost certainly tokenizer artifacts.
+    #
+    # "美 好"       -> "美好"
+    # "实木 还是"   -> "实木还是"
+    # ----------------------------------------------------------
     s = re.sub(
         rf"([{_CJK}]) +(?=[{_CJK}])",
         r"\1",
         s,
     )
 
-    # 中文字符与中文标点之间的错误空格
+    # ----------------------------------------------------------
+    # Chinese character <-> Chinese punctuation
+    #
+    # "你好 ， 世界" -> "你好，世界"
+    # "你好 ，世界"   -> "你好，世界"
+    # ----------------------------------------------------------
     s = re.sub(
         rf"([{_CJK}]) +(?=[{re.escape(_CJK_PUNCT)}])",
         r"\1",
@@ -77,21 +138,20 @@ def _clean(x) -> str:
         s,
     )
 
-    # 中文标点之间不需要空格
+    # Chinese punctuation <-> Chinese punctuation.
     s = re.sub(
         rf"([{re.escape(_CJK_PUNCT)}]) +(?=[{re.escape(_CJK_PUNCT)}])",
         r"\1",
         s,
     )
 
-    # 英文/数字 + 中文标点
+    # English/number <-> Chinese punctuation.
     s = re.sub(
         rf"([A-Za-z0-9]) +(?=[{re.escape(_CJK_PUNCT)}])",
         r"\1",
         s,
     )
 
-    # 中文标点 + 英文/数字
     s = re.sub(
         rf"([{re.escape(_CJK_PUNCT)}]) +(?=[A-Za-z0-9])",
         r"\1",
@@ -100,119 +160,481 @@ def _clean(x) -> str:
 
     return s
 
-def parse_speaker_dialogue(src: str) -> List[Dict]:
-    """Convert <speaker1>/<speaker2> dialogue into messages."""
-    src = _clean(src)
-    if not src:
-        return []
+
+def _normalize_speaker_tag(src: str) -> str:
+    """Normalize common variants of speaker tags."""
     src = src.replace("<speaker 1>", "<speaker1>")
     src = src.replace("<speaker 2>", "<speaker2>")
+    src = src.replace("<speaker_1>", "<speaker1>")
+    src = src.replace("<speaker_2>", "<speaker2>")
+    src = src.replace("<Speaker1>", "<speaker1>")
+    src = src.replace("<Speaker2>", "<speaker2>")
+    src = src.replace("<SPEAKER1>", "<speaker1>")
+    src = src.replace("<SPEAKER2>", "<speaker2>")
+    return src
+
+
+def parse_speaker_dialogue(src: str) -> List[Dict]:
+    """Parse <speaker1>/<speaker2> dialogue by occurrence order.
+
+    IMPORTANT:
+        speaker1 != necessarily user
+        speaker2 != necessarily assistant
+
+    Roles are assigned by the order in which speaker tags appear.
+
+    Example:
+
+        <speaker2>A
+        <speaker1>B
+        <speaker2>C
+
+    becomes:
+
+        user      A
+        assistant B
+        user      C
+    """
+    src = _clean(src)
+
+    if not src:
+        return []
+
+    src = _normalize_speaker_tag(src)
+
+    # Split while preserving speaker tags.
     parts = re.split(r"(<speaker[12]>)", src)
-    messages, current_role, buffer = [], None, []
+
+    messages: List[Dict] = []
+    current_speaker: Optional[str] = None
+    current_role: Optional[str] = None
+    buffer: List[str] = []
+
+    # Maps actual speaker tag -> assigned conversational role.
+    #
+    # This mapping is created dynamically from FIRST APPEARANCE.
+    #
+    # First unseen speaker  -> user
+    # Second unseen speaker -> assistant
+    speaker_roles: Dict[str, str] = {}
+
     for part in parts:
         if not part:
             continue
+
         if part in ("<speaker1>", "<speaker2>"):
-            if current_role is not None:
+            # Flush previous speaker's content.
+            if current_speaker is not None:
                 content = _clean("".join(buffer))
+
                 if content:
-                    messages.append({"role": current_role, "content": content})
-            current_role = "user" if part == "<speaker1>" else "assistant"
+                    messages.append(
+                        {
+                            "role": current_role,
+                            "content": content,
+                        }
+                    )
+
+            current_speaker = part
+
+            # Assign role ONLY when this speaker is encountered
+            # for the first time.
+            if current_speaker not in speaker_roles:
+                if not speaker_roles:
+                    speaker_roles[current_speaker] = "user"
+                elif len(speaker_roles) == 1:
+                    speaker_roles[current_speaker] = "assistant"
+                else:
+                    # Normally there are only two speakers.
+                    # If a malformed dataset introduces more speaker
+                    # identities, alternate by first appearance count.
+                    speaker_roles[current_speaker] = (
+                        "user"
+                        if len(speaker_roles) % 2 == 0
+                        else "assistant"
+                    )
+
+            current_role = speaker_roles[current_speaker]
             buffer = []
+
         else:
             buffer.append(part)
-    if current_role is not None:
+
+    # Flush final speaker.
+    if current_speaker is not None:
         content = _clean("".join(buffer))
+
         if content:
-            messages.append({"role": current_role, "content": content})
+            messages.append(
+                {
+                    "role": current_role,
+                    "content": content,
+                }
+            )
+
     return messages
 
 
+def _merge_consecutive_messages(messages: List[Dict]) -> List[Dict]:
+    """Merge adjacent messages belonging to the same role.
+
+    This avoids creating:
+        user
+        assistant
+        assistant
+
+    simply because the source representation split one reply into
+    multiple pieces.
+    """
+    merged: List[Dict] = []
+
+    for msg in messages:
+        role = msg.get("role")
+        content = _clean(msg.get("content"))
+
+        if role not in {"user", "assistant"}:
+            continue
+
+        if not content:
+            continue
+
+        if merged and merged[-1]["role"] == role:
+            # Preserve a natural separator if the two pieces were
+            # separate messages but did not have punctuation.
+            merged[-1]["content"] += content
+        else:
+            merged.append(
+                {
+                    "role": role,
+                    "content": content,
+                }
+            )
+
+    return merged
+
+
+def normalize_messages(messages) -> Optional[Dict]:
+    """Normalize an already-created messages list.
+
+    Rules:
+      1. Keep only user/assistant messages.
+      2. Remove empty messages.
+      3. NEVER allow assistant to be the first message.
+      4. Drop leading assistant messages rather than relabeling them.
+      5. Merge consecutive messages with the same role.
+      6. Require at least one user and one assistant.
+
+    We deliberately DO NOT turn:
+        assistant -> user
+
+    because that would fabricate a conversation role.
+    """
+    if not isinstance(messages, list):
+        return None
+
+    cleaned: List[Dict] = []
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+
+        role = msg.get("role")
+        content = _clean(msg.get("content"))
+
+        if role not in {"user", "assistant"}:
+            continue
+
+        if not content:
+            continue
+
+        cleaned.append(
+            {
+                "role": role,
+                "content": content,
+            }
+        )
+
+    if not cleaned:
+        return None
+
+    # ----------------------------------------------------------
+    # Drop leading assistant messages.
+    #
+    # We do NOT relabel them as user.
+    # ----------------------------------------------------------
+    while cleaned and cleaned[0]["role"] == "assistant":
+        cleaned.pop(0)
+
+    if not cleaned:
+        return None
+
+    # ----------------------------------------------------------
+    # Merge consecutive same-role messages.
+    # ----------------------------------------------------------
+    cleaned = _merge_consecutive_messages(cleaned)
+
+    if not cleaned:
+        return None
+
+    # ----------------------------------------------------------
+    # Final safety checks.
+    # ----------------------------------------------------------
+    if cleaned[0]["role"] != "user":
+        return None
+
+    if not any(m["role"] == "assistant" for m in cleaned):
+        return None
+
+    if not any(m["role"] == "user" for m in cleaned):
+        return None
+
+    return {"messages": cleaned}
+
+
 def parse_dialog_list(dialog) -> Optional[Dict]:
-    """Convert a list of utterances into alternating messages."""
+    """Parse a plain list of utterances by position.
+
+    Example:
+        ["A", "B", "C", "D"]
+
+    becomes:
+        user A
+        assistant B
+        user C
+        assistant D
+    """
     if not isinstance(dialog, list):
         return None
-    utterances = [_clean(x) for x in dialog if _clean(x)]
+
+    utterances: List[str] = []
+
+    for x in dialog:
+        # Support both:
+        #   ["hello", "hi"]
+        #
+        # and accidentally nested message objects:
+        #   [{"role": "user", "content": "hello"}, ...]
+        if isinstance(x, dict):
+            content = _clean(x.get("content"))
+        else:
+            content = _clean(x)
+
+        if content:
+            utterances.append(content)
+
     if len(utterances) < 2:
         return None
-    messages = [{"role": "user" if i % 2 == 0 else "assistant", "content": u}
-                for i, u in enumerate(utterances)]
-    return {"messages": messages}
+
+    messages = [
+        {
+            "role": "user" if i % 2 == 0 else "assistant",
+            "content": u,
+        }
+        for i, u in enumerate(utterances)
+    ]
+
+    return normalize_messages(messages)
 
 
 def parse_t5_text(text) -> Optional[Dict]:
     """Parse JSON stored inside the dataset's `text` field."""
     text = _clean(text)
+
     if not text:
         return None
+
     try:
         obj = json.loads(text)
     except (json.JSONDecodeError, TypeError):
         return None
+
     if not isinstance(obj, dict):
         return None
-    src, tgt = obj.get("src"), obj.get("tgt")
+
+    src = obj.get("src")
+    tgt = obj.get("tgt")
+
     if src is None or tgt is None:
         return None
-    src, tgt = _clean(src), _clean(tgt)
+
+    src = _clean(src)
+    tgt = _clean(tgt)
+
     if not src or not tgt:
         return None
+
+    # ----------------------------------------------------------
+    # src contains speaker tags.
+    #
+    # DO NOT interpret speaker1/speaker2 as fixed roles.
+    # parse_speaker_dialogue assigns roles by first appearance.
+    # ----------------------------------------------------------
     if "<speaker1>" in src or "<speaker2>" in src:
         messages = parse_speaker_dialogue(src)
+
         if not messages:
             return None
-        messages.append({"role": "assistant", "content": tgt})
-        return {"messages": messages}
-    return {"messages": [{"role": "user", "content": src},
-                         {"role": "assistant", "content": tgt}]}
+
+        # tgt is the response to the entire src dialogue.
+        #
+        # It is explicitly an assistant response.
+        messages.append(
+            {
+                "role": "assistant",
+                "content": tgt,
+            }
+        )
+
+        return normalize_messages(messages)
+
+    # Plain src/tgt pair.
+    return normalize_messages(
+        [
+            {"role": "user", "content": src},
+            {"role": "assistant", "content": tgt},
+        ]
+    )
 
 
 def parse_example(ex) -> Optional[Dict]:
-    """One HF example -> messages conversation. Same dispatch as the user's
-    loop: T5-text > src/tgt > prompt/target > dialog list > plain text."""
+    """Convert one HF example into standard messages.
+
+    Supported formats, in priority order:
+
+      1. text -> JSON containing src/tgt
+      2. src + tgt
+      3. prompt/question/input + target/answer/response
+      4. dialog/dialogue/dialogues list
+      5. plain text
+
+    All paths go through normalize_messages().
+    """
     if not isinstance(ex, dict):
         return None
+
+    # ==========================================================
+    # 1. T5-style JSON stored in `text`
+    # ==========================================================
     if ex.get("text") is not None:
         parsed = parse_t5_text(ex["text"])
+
         if parsed is not None:
             return parsed
+
+    # ==========================================================
+    # 2. Explicit src / tgt
+    # ==========================================================
     if ex.get("src") is not None and ex.get("tgt") is not None:
-        src, tgt = _clean(ex["src"]), _clean(ex["tgt"])
-        if src and tgt:
-            if "<speaker1>" in src or "<speaker2>" in src:
-                messages = parse_speaker_dialogue(src)
-                if messages:
-                    messages.append({"role": "assistant", "content": tgt})
-                    return {"messages": messages}
-            else:
-                return {"messages": [{"role": "user", "content": src},
-                                     {"role": "assistant", "content": tgt}]}
-        return None
-    p = ex.get("prompt") or ex.get("question") or ex.get("input")
-    t = ex.get("target") or ex.get("answer") or ex.get("response")
-    if p is not None and t is not None:
-        if isinstance(p, list):
-            messages = parse_dialog_list(p)
-            if messages is not None:
-                target = _clean(t)
-                if target:
-                    messages["messages"].append({"role": "assistant", "content": target})
-                return messages
+        src = _clean(ex["src"])
+        tgt = _clean(ex["tgt"])
+
+        if not src or not tgt:
             return None
-        p, t = _clean(p), _clean(t)
+
+        if "<speaker1>" in src or "<speaker2>" in src:
+            messages = parse_speaker_dialogue(src)
+
+            if not messages:
+                return None
+
+            # tgt is always the answer.
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": tgt,
+                }
+            )
+
+            return normalize_messages(messages)
+
+        return normalize_messages(
+            [
+                {"role": "user", "content": src},
+                {"role": "assistant", "content": tgt},
+            ]
+        )
+
+    # ==========================================================
+    # 3. prompt / question / input + target / answer / response
+    # ==========================================================
+    p = ex.get("prompt")
+
+    if p is None:
+        p = ex.get("question")
+
+    if p is None:
+        p = ex.get("input")
+
+    t = ex.get("target")
+
+    if t is None:
+        t = ex.get("answer")
+
+    if t is None:
+        t = ex.get("response")
+
+    if p is not None and t is not None:
+
+        # prompt is a list of alternating utterances.
+        if isinstance(p, list):
+            parsed = parse_dialog_list(p)
+
+            if parsed is None:
+                return None
+
+            target = _clean(t)
+
+            if not target:
+                return None
+
+            messages = parsed["messages"]
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": target,
+                }
+            )
+
+            return normalize_messages(messages)
+
+        p = _clean(p)
+        t = _clean(t)
+
         if p and t:
-            return {"messages": [{"role": "user", "content": p},
-                                 {"role": "assistant", "content": t}]}
+            return normalize_messages(
+                [
+                    {"role": "user", "content": p},
+                    {"role": "assistant", "content": t},
+                ]
+            )
+
         return None
-    dialog = ex.get("dialog") or ex.get("dialogue") or ex.get("dialogues")
+
+    # ==========================================================
+    # 4. dialog / dialogue / dialogues
+    # ==========================================================
+    dialog = (
+        ex.get("dialog")
+        or ex.get("dialogue")
+        or ex.get("dialogues")
+    )
+
     if isinstance(dialog, list):
         return parse_dialog_list(dialog)
+
+    # ==========================================================
+    # 5. Plain text fallback
+    #
+    # A single utterance cannot form a user/assistant training
+    # conversation, so we deliberately reject it here.
+    # ==========================================================
     if ex.get("text") is not None:
         text = _clean(ex["text"])
-        if text:
-            return {"messages": [{"role": "user", "content": text}]}
-    return None
 
+        if text:
+            return None
+
+    return None
 
 # ============================================================== streaming IO
 class JsonlWriter:
