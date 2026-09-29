@@ -41,11 +41,64 @@ ROW_BYTES_TOK = 128     # rough bytes/token-sequence for flush sizing
 
 # ============================================================== HF parsing
 # (user's multi-format HF parsing, preserved as pure functions)
+_CJK = r"\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+_CJK_PUNCT = "，。！？；：、（）【】「」『』《》〈〉“”‘’"
+
 def _clean(x) -> str:
     if x is None:
         return ""
-    return str(x).strip()
 
+    s = str(x)
+
+    # 统一各种 Unicode 空白
+    s = re.sub(r"[\u00A0\u2000-\u200B\u3000\t\r\n]+", " ", s)
+    s = s.strip()
+
+    if not s:
+        return ""
+
+    # 中文字符之间的错误空格
+    s = re.sub(
+        rf"([{_CJK}]) +(?=[{_CJK}])",
+        r"\1",
+        s,
+    )
+
+    # 中文字符与中文标点之间的错误空格
+    s = re.sub(
+        rf"([{_CJK}]) +(?=[{re.escape(_CJK_PUNCT)}])",
+        r"\1",
+        s,
+    )
+
+    s = re.sub(
+        rf"([{re.escape(_CJK_PUNCT)}]) +(?=[{_CJK}])",
+        r"\1",
+        s,
+    )
+
+    # 中文标点之间不需要空格
+    s = re.sub(
+        rf"([{re.escape(_CJK_PUNCT)}]) +(?=[{re.escape(_CJK_PUNCT)}])",
+        r"\1",
+        s,
+    )
+
+    # 英文/数字 + 中文标点
+    s = re.sub(
+        rf"([A-Za-z0-9]) +(?=[{re.escape(_CJK_PUNCT)}])",
+        r"\1",
+        s,
+    )
+
+    # 中文标点 + 英文/数字
+    s = re.sub(
+        rf"([{re.escape(_CJK_PUNCT)}]) +(?=[A-Za-z0-9])",
+        r"\1",
+        s,
+    )
+
+    return s
 
 def parse_speaker_dialogue(src: str) -> List[Dict]:
     """Convert <speaker1>/<speaker2> dialogue into messages."""
