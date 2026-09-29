@@ -6,3 +6,4 @@
 eval_report.json
 __pycache__/
 /logs/
+/latent_vis/
