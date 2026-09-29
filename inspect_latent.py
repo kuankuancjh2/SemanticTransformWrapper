@@ -19,7 +19,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from src.checkpoints import build_stage1_from_checkpoint, build_stage2_from_checkpoint
+from src.checkpoints import (build_stage1_from_checkpoint,
+                             build_stage2_from_checkpoint, load_checkpoint)
 from src.config import resolve_device
 from src.data import format_conversation, load_messages
 from src.utils.logging_utils import setup_logging
@@ -53,7 +54,7 @@ def main() -> None:
     setup_logging("logs")
     OUT_DIR.mkdir(exist_ok=True)
     device = resolve_device(args.device)
-    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    ckpt = load_checkpoint(args.checkpoint)
     if ckpt.get("stage") in (2, 3):
         model, cfg, tok = build_stage2_from_checkpoint(ckpt, device)
     else:

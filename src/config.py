@@ -176,6 +176,13 @@ class TrainConfig:
     amp: str = "auto"  # auto | bf16 | fp16 | off
     num_workers: int = 2
     seed: int = 3407
+    # --data: train directly from an external .jsonl/.json file (skips the
+    # processed splits). Each line: {"messages": [...]} (standard format) or
+    # {"prompt": ..., "target": ...} or plain text. See data/example_toy.jsonl.
+    data_path: Optional[str] = None
+    # gzip-compress every checkpoint EXCEPT best.pt (epoch snapshots also drop
+    # optimizer state and store fp16 weights).
+    compress_checkpoints: bool = True
     # Memory controls: keep only latest/best checkpoints (epoch snapshots are
     # ~400MB each for the default architecture and churn disk/RAM on Windows).
     save_epoch_checkpoints: bool = True

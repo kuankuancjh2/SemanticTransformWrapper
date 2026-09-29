@@ -1,10 +1,10 @@
 """Stage 1 trainer: Language Autoencoder with semantic-bottleneck losses.
 
-Supports an optional Semantic VAE (config.vae.enabled / --vae):
+Supports an optional Semantic VAE (config.vae.enabled / --vae) and multi-GPU
+DDP via torchrun (single-process runs are unaffected).
   L = L_recon + beta_eff * KL(q(z|x) || N(0,I)) + paraphrase/variance/covariance
   beta_eff = beta * min(1, step / kl_warmup_steps)        [KL annealing]
-Posterior-collapse guards: free bits (per-dim KL floor), logvar clamping,
-active-units monitoring. Eval/inference use the deterministic mu.
+Posterior-collapse guards: free bits, logvar clamping, active-units monitor.
 """
 from __future__ import annotations
 
@@ -16,8 +16,8 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from ..checkpoints import save_checkpoint
-from ..config import Config, resolve_device
+from ..checkpoints import load_checkpoint, save_train_checkpoint
+from ..config import Config
 from ..generation import Generator
 from ..losses import (active_units, covariance_loss, kl_divergence_loss,
                       latent_stats, paraphrase_consistency_loss,
@@ -26,13 +26,17 @@ from ..losses import (active_units, covariance_loss, kl_divergence_loss,
 from ..model import Stage1Model
 from ..utils.logging_utils import get_logger
 from ..utils.seed import capture_random_state, restore_random_state, set_seed
-from .common import lr_lambda, make_loaders, save_preview, setup_amp
+from .common import lr_lambda, make_loaders, resolve_tokenizer, save_preview, setup_amp
+from .distributed import (average_stats, cleanup_distributed, device_for,
+                          init_distributed, is_main, sampler_epoch, unwrap,
+                          wrap_model)
 
 log = get_logger("stage1")
 
 
 def validate(model: Stage1Model, loader, cfg: Config, device: torch.device,
              pad_id: int) -> Dict[str, float]:
+    model = unwrap(model)  # accept a DDP-wrapped model
     model.eval()
     tot = {k: 0.0 for k in ("loss", "recon", "paraphrase", "variance", "covariance",
                             "ppl", "acc", "kl")}
@@ -54,7 +58,6 @@ def validate(model: Stage1Model, loader, cfg: Config, device: torch.device,
                                                      cfg.vae.free_bits)
             else:
                 kl_loss = kl_raw = torch.zeros((), device=device)
-            # paraphrase consistency applies to true paraphrase rows only
             is_para = (batch["ptype"] == 1).to(device)
             if is_para.any():
                 l_para = paraphrase_consistency_loss(z[is_para], z[is_para])
@@ -62,8 +65,6 @@ def validate(model: Stage1Model, loader, cfg: Config, device: torch.device,
                 l_para = torch.zeros((), device=device)
             l_var = variance_loss(z, cfg.loss.variance_target)
             l_cov = covariance_loss(z)
-            # validation reports the loss at the FULL beta (annealing is a
-            # training-time schedule only)
             beta_val = cfg.vae.beta if cfg.vae.enabled else 0.0
             loss = l_recon + cfg.loss.paraphrase_weight * l_para + \
                 cfg.loss.variance_weight * l_var + cfg.loss.covariance_weight * l_cov \
@@ -78,8 +79,6 @@ def validate(model: Stage1Model, loader, cfg: Config, device: torch.device,
             tot["ppl"] += math.exp(min(20.0, l_recon.item())) * B
             tot["acc"] += token_accuracy(out["logits"], labels, pad_id) * B
             n += B
-            # cap accumulated latents: the stats below only need a sample;
-            # holding ALL validation latents grows memory with val size.
             if sum(c.shape[0] for c in latent_chunks) < 4096:
                 latent_chunks.append(z.reshape(-1, z.size(-1)).cpu())
                 if cfg.vae.enabled:
@@ -87,6 +86,7 @@ def validate(model: Stage1Model, loader, cfg: Config, device: torch.device,
                     lv_chunks.append(out["logvar"].reshape(-1, z.size(-1)).cpu())
     model.train()
     stats = {k: v / max(1, n) for k, v in tot.items()}
+    stats["n"] = float(n)  # weight for cross-rank averaging
     allz = torch.cat(latent_chunks)[:2048]
     stats.update({f"latent/{k}": v for k, v in latent_stats(allz.unsqueeze(0)).items()})
     if cfg.vae.enabled and mu_chunks:
@@ -98,17 +98,22 @@ def validate(model: Stage1Model, loader, cfg: Config, device: torch.device,
 
 def train_stage1(cfg: Config, resume: Optional[str] = None) -> str:
     set_seed(cfg.train.seed)
-    device = resolve_device(cfg.train.device)
+    rank, _world, local_rank, ddp = init_distributed()
+    device = device_for(local_rank, cfg.train.device)
     ckpt_dir = Path(cfg.train.checkpoint_dir) / "stage1"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    writer = SummaryWriter(str(Path(cfg.train.log_dir) / "stage1"))
+    if is_main(rank):
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+    writer = (SummaryWriter(str(Path(cfg.train.log_dir) / "stage1"))
+              if is_main(rank) else None)
 
-    tok, train_loader, val_loader = _data(cfg)
+    tok, train_loader, val_loader = _data(cfg, ddp)
     cfg.model.vocab_size = tok.vocab_size
     model = Stage1Model(cfg).to(device)
+    raw_model = model                      # unwrapped: preview / .encode() access
+    model = wrap_model(model, ddp, device)
     model.train()
 
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg.train.lr,
+    opt = torch.optim.AdamW(raw_model.parameters(), lr=cfg.train.lr,
                             weight_decay=cfg.train.weight_decay)
     total_steps = cfg.train.max_steps or cfg.train.epochs * max(1, len(train_loader))
     sched = torch.optim.lr_scheduler.LambdaLR(
@@ -117,8 +122,8 @@ def train_stage1(cfg: Config, resume: Optional[str] = None) -> str:
 
     start_epoch, gstep, best = 0, 0, float("inf")
     if resume:
-        ckpt = torch.load(resume, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"])
+        ckpt = load_checkpoint(resume, map_location=str(device))
+        raw_model.load_state_dict(ckpt["model_state_dict"])
         if ckpt.get("optimizer_state_dict"):
             opt.load_state_dict(ckpt["optimizer_state_dict"])
         if ckpt.get("scheduler_state_dict"):
@@ -129,12 +134,14 @@ def train_stage1(cfg: Config, resume: Optional[str] = None) -> str:
             restore_random_state(ckpt["random_state"])
         log.info("Resumed stage1 from %s (epoch %d, step %d)", resume, start_epoch, gstep)
 
-    gen = Generator(model, tok, cfg.data.max_seq_len, cfg.gen, device)
+    gen = Generator(raw_model, tok, cfg.data.max_seq_len, cfg.gen, device)
     stop = False
     bad_vals = 0
 
     for epoch in range(start_epoch, cfg.train.epochs):
-        pbar = tqdm(train_loader, desc=f"stage1 epoch{epoch}", ncols=110)
+        sampler_epoch([train_loader, val_loader], epoch)
+        pbar = tqdm(train_loader, desc=f"stage1 epoch{epoch}", ncols=110,
+                    disable=not is_main(rank))
         for batch in pbar:
             prompt = batch["prompt"].to(device)
             pmask = batch["prompt_mask"].to(device)
@@ -157,14 +164,12 @@ def train_stage1(cfg: Config, resume: Optional[str] = None) -> str:
             is_para = (batch["ptype"] == 1)
             if is_para.any():
                 # paraphrase rows carry (A, B) as prompt/target; the B side is a
-                # TARGET (no gradient needed) -> encode under no_grad. This both
-                # halves activation memory on paraphrase batches and matches the
-                # loss semantics (consistency toward a fixed anchor).
-                # sample=False forces the DETERMINISTIC mu for the anchor so the
-                # consistency loss does not chase sampling noise.
+                # TARGET (no gradient needed) -> encode under no_grad, and with
+                # sample=False (deterministic mu) so the consistency loss does
+                # not chase sampling noise.
                 with torch.no_grad():
-                    z_b = model.encode(target[is_para], tmask[is_para],
-                                       apply_noise=False, sample=False)
+                    z_b = raw_model.encode(target[is_para], tmask[is_para],
+                                           apply_noise=False, sample=False)
                 l_para = paraphrase_consistency_loss(z[is_para], z_b)
             else:
                 l_para = torch.zeros((), device=device)
@@ -175,20 +180,17 @@ def train_stage1(cfg: Config, resume: Optional[str] = None) -> str:
             if cfg.vae.enabled:
                 loss = loss + beta_eff * kl_loss
 
+            opt.zero_grad(set_to_none=True)
             (loss / cfg.train.grad_accum).backward()
-            if (gstep + 1) % cfg.train.grad_accum == 0:
-                if cfg.train.grad_clip > 0:
-                    # float() immediately: the returned tensor carries the whole
-                    # autograd graph; keeping it as a tensor across iterations
-                    # pins the previous step's graph in memory (real leak).
-                    gnorm = float(torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), cfg.train.grad_clip))
-                opt.step()
-                sched.step()
-                opt.zero_grad(set_to_none=True)
-
+            if cfg.train.grad_clip > 0:
+                # float() immediately: the tensor return pins the autograd graph
+                gnorm = float(torch.nn.utils.clip_grad_norm_(
+                    raw_model.parameters(), cfg.train.grad_clip))
+            opt.step()
+            sched.step()
             gstep += 1
-            if gstep % cfg.train.log_interval == 0:
+
+            if writer is not None and gstep % cfg.train.log_interval == 0:
                 ls = latent_stats(z.unsqueeze(0))
                 writer.add_scalar("loss/train", loss.item(), gstep)
                 writer.add_scalar("loss/reconstruction", l_recon.item(), gstep)
@@ -209,33 +211,39 @@ def train_stage1(cfg: Config, resume: Optional[str] = None) -> str:
 
             if gstep % cfg.train.val_interval == 0 or gstep == total_steps:
                 vs = validate(model, val_loader, cfg, device, tok.pad_id)
-                for k, v in vs.items():
-                    writer.add_scalar(f"val/{k}" if not k.startswith("latent") else k, v, gstep)
-                writer.add_scalar("loss/val", vs["loss"], gstep)
-                writer.add_scalar("perplexity", vs["ppl"], gstep)
-                writer.add_scalar("token_accuracy", vs["acc"], gstep)
-                if cfg.vae.enabled:
-                    writer.add_scalar("loss/val_kl", vs["kl"], gstep)
-                extra = (f" kl={vs['kl']:.3f} au={vs.get('vae/active_units', 0.0):.0f}"
-                         if cfg.vae.enabled else "")
-                log.info("val @%d: loss=%.3f ppl=%.2f acc=%.3f latent_std=%.3f "
-                         "cos=%.3f eff_rank=%.1f%s",
-                         gstep, vs["loss"], vs["ppl"], vs["acc"], vs["latent/std"],
-                         vs["latent/cos_sim"], vs["latent/eff_rank"], extra)
-                save_preview(cfg, model, gen, gstep, cfg.train.samples_dir)
+                n_rank = float(vs.pop("n", 1.0))
+                vs = average_stats(vs, n_rank)
+                if writer is not None:
+                    for k, v in vs.items():
+                        writer.add_scalar(f"val/{k}" if not k.startswith("latent") else k,
+                                          v, gstep)
+                    writer.add_scalar("loss/val", vs["loss"], gstep)
+                    writer.add_scalar("perplexity", vs["ppl"], gstep)
+                    writer.add_scalar("token_accuracy", vs["acc"], gstep)
+                if is_main(rank):
+                    extra = (f" kl={vs['kl']:.3f} au={vs.get('vae/active_units', 0.0):.0f}"
+                             if cfg.vae.enabled else "")
+                    log.info("val @%d: loss=%.3f ppl=%.2f acc=%.3f latent_std=%.3f "
+                             "cos=%.3f eff_rank=%.1f%s",
+                             gstep, vs["loss"], vs["ppl"], vs["acc"], vs["latent/std"],
+                             vs["latent/cos_sim"], vs["latent/eff_rank"], extra)
+                    save_preview(cfg, raw_model, gen, gstep, cfg.train.samples_dir)
                 is_best = vs["loss"] < best
                 best = min(best, vs["loss"])
-                save_checkpoint(ckpt_dir / "latest.pt", model, opt, sched, epoch,
-                                gstep, best, cfg, tok_path(cfg),
-                                capture_random_state(), {"stage": 1})
-                if is_best:
-                    save_checkpoint(ckpt_dir / "best.pt", model, opt, sched, epoch,
-                                    gstep, best, cfg, tok_path(cfg),
-                                    capture_random_state(), {"stage": 1})
-                if cfg.train.save_epoch_checkpoints:
-                    save_checkpoint(ckpt_dir / f"epoch_{epoch}.pt", model, opt, sched,
-                                    epoch, gstep, best, cfg, tok_path(cfg),
-                                    capture_random_state(), {"stage": 1})
+                if is_main(rank):  # only rank 0 touches the filesystem
+                    save_train_checkpoint(ckpt_dir, "latest.pt", raw_model, opt,
+                                          sched, epoch, gstep, best, cfg,
+                                          tok_path(cfg), capture_random_state(),
+                                          stage=1)
+                    if is_best:
+                        save_train_checkpoint(ckpt_dir, "best.pt", raw_model, opt,
+                                              sched, epoch, gstep, best, cfg,
+                                              tok_path(cfg), capture_random_state(),
+                                              stage=1)
+                    if cfg.train.save_epoch_checkpoints:
+                        save_train_checkpoint(ckpt_dir, f"epoch_{epoch}.pt", raw_model,
+                                              opt, sched, epoch, gstep, best, cfg,
+                                              tok_path(cfg), None, stage=1)
                 if cfg.train.patience is not None:
                     bad_vals = bad_vals + 1 if vs["loss"] > best else 0
                     if bad_vals >= cfg.train.patience:
@@ -247,16 +255,18 @@ def train_stage1(cfg: Config, resume: Optional[str] = None) -> str:
                 break
         if stop:
             break
-    writer.close()
-    log.info("Stage 1 done. best val loss=%.4f -> %s", best, ckpt_dir / "best.pt")
+    if writer is not None:
+        writer.close()
+    if is_main(rank):
+        log.info("Stage 1 done. best val loss=%.4f -> %s", best, ckpt_dir / "best.pt")
+    cleanup_distributed()
     return str(ckpt_dir / "best.pt")
 
 
-def _data(cfg: Config):
+def _data(cfg: Config, ddp: bool = False):
     from .common import make_loaders as ml
-    from ..tokenization import load_tokenizer
-    tok = load_tokenizer(tok_path(cfg))
-    tr, va, _ = ml(cfg, tok, stage=1)
+    tok = resolve_tokenizer(cfg)  # cache-hit load, or fresh over --data texts
+    tr, va, _ = ml(cfg, tok, stage=1, ddp=ddp)
     return tok, tr, va
 
 

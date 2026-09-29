@@ -9,7 +9,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import torch
 
-from src.checkpoints import build_stage1_from_checkpoint, build_stage2_from_checkpoint
+from src.checkpoints import (build_stage1_from_checkpoint,
+                             build_stage2_from_checkpoint, load_checkpoint)
 from src.config import resolve_device
 from src.generation import Generator
 from src.utils.logging_utils import setup_logging
@@ -24,7 +25,8 @@ def main() -> None:
 
     ckpt_path = args.checkpoint
     if ckpt_path is None:
-        cands = [Path("checkpoints/stage2/best.pt"), Path("checkpoints/stage1/best.pt")]
+        cands = sorted(Path("checkpoints/stage2").glob("*/best.pt")) + \
+            [Path("checkpoints/stage1/best.pt")]
         cands = [c for c in cands if c.exists()]
         if not cands:
             print("no checkpoint found; run train_stage1.py first")
@@ -32,7 +34,7 @@ def main() -> None:
         ckpt_path = cands[0]
 
     device = resolve_device(args.device)
-    ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+    ckpt = load_checkpoint(ckpt_path)
     if ckpt.get("stage") in (2, 3):
         model, cfg, tok = build_stage2_from_checkpoint(ckpt, device)
         core_name = ckpt.get("core_type", cfg.core.type)

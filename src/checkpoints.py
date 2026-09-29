@@ -1,6 +1,14 @@
-"""Checkpoint save/load with full reproducibility payload."""
+"""Checkpoint save/load with full reproducibility payload.
+
+Storage policy (v3):
+  best.pt        full state, UNCOMPRESSED (resume-anchored init for later stages)
+  latest.pt.gz   full state (incl. optimizer), gzip-compressed
+  epoch_N.pt.gz  fp16 weights only (no optimizer/scheduler/random state), gzip
+All loaders are gzip-transparent: passing either `x.pt` or `x.pt.gz` works.
+"""
 from __future__ import annotations
 
+import gzip
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -10,7 +18,67 @@ from .config import Config
 from .model.model import Stage1Model, Stage2Model
 from .model.cores import build_semantic_core
 from .tokenization import load_tokenizer
-from .utils.seed import capture_random_state, restore_random_state
+from .utils.seed import capture_random_state, restore_random_state  # noqa: F401
+
+
+def half_state_dict(sd: Dict[str, Any]) -> Dict[str, Any]:
+    """fp32 -> fp16 for floating tensors (halves snapshot size; load_state_dict
+    casts back to the model's parameter dtypes on load)."""
+    return {k: (v.half() if torch.is_tensor(v) and v.is_floating_point() else v)
+            for k, v in sd.items()}
+
+
+def save_payload(path: str | Path, payload: Dict[str, Any],
+                 compress: bool = False) -> str:
+    """torch.save, optionally through gzip (adds .gz when missing)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if compress:
+        if path.suffix != ".gz":
+            path = path.with_suffix(path.suffix + ".gz")
+        with gzip.open(path, "wb") as f:
+            torch.save(payload, f)
+    else:
+        torch.save(payload, str(path))
+    return str(path)
+
+
+def save_train_checkpoint(out_dir: str | Path, tag: str, model: torch.nn.Module,
+                          optimizer: Optional[torch.optim.Optimizer],
+                          scheduler, epoch: int, step: int, best_val_loss: float,
+                          cfg: Config, tokenizer_path: str,
+                          random_state: Optional[Dict[str, Any]] = None, *,
+                          stage: Optional[int] = None,
+                          core_type: Optional[str] = None) -> str:
+    """Trainer-side save policy (see module docstring):
+      best.pt       full payload, UNCOMPRESSED (init anchor for the next stage)
+      latest.pt.gz  full payload (incl. optimizer, resume-ready), gzip
+      epoch_*.pt.gz weights-only fp16 snapshot (no optimizer/scheduler/RNG), gzip
+    DDP-safe (unwraps .module) and honors train.compress_checkpoints."""
+    m = getattr(model, "module", model)
+    payload: Dict[str, Any] = {
+        "model_state_dict": m.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict() if optimizer else None,
+        "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+        "epoch": epoch,
+        "step": step,
+        "best_val_loss": best_val_loss,
+        "config": cfg.to_dict(),
+        "tokenizer": tokenizer_path,
+        "random_state": random_state,
+        "stage": stage,
+        "core_type": core_type,
+    }
+    compress = bool(getattr(cfg.train, "compress_checkpoints", True))
+    if tag == "best.pt":
+        return save_payload(Path(out_dir) / tag, payload, compress=False)
+    if tag.startswith("epoch_"):
+        payload["optimizer_state_dict"] = None
+        payload["scheduler_state_dict"] = None
+        payload["random_state"] = None
+        payload["model_state_dict"] = half_state_dict(payload["model_state_dict"])
+        return save_payload(Path(out_dir) / tag, payload, compress=compress)
+    return save_payload(Path(out_dir) / tag, payload, compress=compress)
 
 
 def save_checkpoint(path: str | Path, model: torch.nn.Module,
@@ -37,7 +105,12 @@ def save_checkpoint(path: str | Path, model: torch.nn.Module,
 
 
 def load_checkpoint(path: str | Path, map_location: str = "cpu") -> Dict[str, Any]:
-    return torch.load(str(path), map_location=map_location, weights_only=False)
+    """Gzip-transparent checkpoint loading (.pt and .pt.gz both work)."""
+    p = str(path)
+    if p.endswith(".gz"):
+        with gzip.open(p, "rb") as f:
+            return torch.load(f, map_location=map_location, weights_only=False)
+    return torch.load(p, map_location=map_location, weights_only=False)
 
 
 def build_stage1_from_checkpoint(ckpt: Dict[str, Any], device: torch.device

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -10,7 +11,10 @@ _FMT = "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s"
 
 def setup_logging(log_dir: str | Path | None = None, level: int = logging.INFO) -> None:
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
-    if log_dir is not None:
+    # under torchrun only rank 0 owns the shared run.log (avoids interleaved
+    # writes from every rank)
+    file_ok = os.environ.get("RANK", "0") in ("", "0")
+    if log_dir is not None and file_ok:
         log_dir = Path(log_dir)
         log_dir.mkdir(parents=True, exist_ok=True)
         handlers.append(logging.FileHandler(log_dir / "run.log", encoding="utf-8"))

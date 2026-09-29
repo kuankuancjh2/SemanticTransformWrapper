@@ -31,10 +31,14 @@ def main() -> None:
     ap.add_argument("--num-workers", type=int, default=None)
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--val-interval", type=int, default=None)
+    ap.add_argument("--data", default=None,
+                    help="train directly from an external .jsonl/.json file (messages or prompt/target format); see data/example_toy.jsonl")
     ap.add_argument("--offline", action="store_true")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    if args.data:
+        cfg.train.data_path = args.data
     if args.device:
         cfg.train.device = args.device
     if args.batch_size:

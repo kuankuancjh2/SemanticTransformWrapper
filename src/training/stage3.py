@@ -24,7 +24,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from ..checkpoints import load_checkpoint
+from ..checkpoints import load_checkpoint, save_train_checkpoint
 from ..config import Config, resolve_device
 from ..generation import Generator
 from ..losses import (covariance_loss, kl_divergence_loss, latent_set_loss,
@@ -35,6 +35,9 @@ from ..model.cores import build_semantic_core, core_forward
 from ..utils.logging_utils import get_logger
 from ..utils.seed import capture_random_state, restore_random_state, set_seed
 from .common import lr_lambda, make_loaders, save_preview, setup_amp
+from .distributed import (average_stats, cleanup_distributed, device_for,
+                          init_distributed, is_main, sampler_epoch,
+                          sync_gradients)
 from .stage1 import tok_path
 from .stage2 import build_memory_state, core_is_memory, is_conditioned_diffusion
 
@@ -107,19 +110,24 @@ def validate_stage3(model: Stage2Model, loader, cfg: Config, device,
             tot["acc"] += token_accuracy(out["logits"], out["labels"], pad_id) * B
             n += B
     model.train()
-    return {k: v / max(1, n) for k, v in tot.items()}
+    stats = {k: v / max(1, n) for k, v in tot.items()}
+    stats["n"] = float(n)  # weight for cross-rank averaging
+    return stats
 
 
 def train_stage3(cfg: Config, stage1_ckpt: Optional[str] = None,
                  resume: Optional[str] = None,
                  core_override: Optional[str] = None) -> str:
     set_seed(cfg.train.seed)
-    device = resolve_device(cfg.train.device)
-    ckpt_dir = Path(cfg.train.checkpoint_dir) / "stage3"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    rank, _world, local_rank, ddp = init_distributed()
+    device = device_for(local_rank, cfg.train.device)
     if core_override:
         cfg.core.type = core_override
-    writer = SummaryWriter(str(Path(cfg.train.log_dir) / f"stage3_{cfg.core.type}"))
+    # per-core checkpoint dir: different cores NEVER overwrite each other
+    ckpt_dir = Path(cfg.train.checkpoint_dir) / "stage3" / cfg.core.type
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    writer = (SummaryWriter(str(Path(cfg.train.log_dir) / f"stage3_{cfg.core.type}"))
+              if is_main(rank) else None)
 
     # ---- assemble the FULL model (all modules), init from stage-1 weights
     if stage1_ckpt:
@@ -137,10 +145,10 @@ def train_stage3(cfg: Config, stage1_ckpt: Optional[str] = None,
                          max_seq_len=s1_cfg.model.max_seq_len).items():
             setattr(cfg.model, k, v)
     else:
-        from ..tokenization import load_tokenizer
         from ..model import Stage1Model
+        from .common import resolve_tokenizer
         s1_cfg = cfg
-        tok = load_tokenizer(tok_path(cfg))
+        tok = resolve_tokenizer(cfg)
         cfg.model.vocab_size = tok.vocab_size
         s1_model = Stage1Model(cfg).to(device)
 
@@ -152,7 +160,7 @@ def train_stage3(cfg: Config, stage1_ckpt: Optional[str] = None,
     params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=cfg.stage3.lr,
                             weight_decay=cfg.train.weight_decay)
-    train_loader, val_loader, _ = make_loaders(cfg, tok, stage=3)
+    train_loader, val_loader, _ = make_loaders(cfg, tok, stage=3, ddp=ddp)
     total_steps = cfg.stage3.max_steps or cfg.stage3.epochs * max(1, len(train_loader))
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lr_lambda(cfg.stage3.warmup_steps, total_steps))
@@ -160,7 +168,7 @@ def train_stage3(cfg: Config, stage1_ckpt: Optional[str] = None,
 
     start_epoch, gstep, best = 0, 0, float("inf")
     if resume:
-        r = torch.load(resume, map_location=device, weights_only=False)
+        r = load_checkpoint(resume, map_location=str(device))
         model.load_state_dict(r["model_state_dict"])
         if r.get("optimizer_state_dict"):
             opt.load_state_dict(r["optimizer_state_dict"])
@@ -173,26 +181,23 @@ def train_stage3(cfg: Config, stage1_ckpt: Optional[str] = None,
     gen = Generator(model, tok, cfg.data.max_seq_len, cfg.gen, device)
 
     def save(tag: str, epoch: int, step: int, val: float):
-        torch.save({
-            "model_state_dict": model.state_dict(),
-            "core_state_dict": core.state_dict(),
-            "optimizer_state_dict": opt.state_dict(),
-            "scheduler_state_dict": sched.state_dict(),
-            "epoch": epoch, "step": step, "best_val_loss": val,
-            "config": cfg.to_dict(), "tokenizer": tok_path(cfg),
-            "random_state": capture_random_state(), "stage": 3,
-            "core_type": cfg.core.type,
-        }, str(ckpt_dir / tag))
+        save_train_checkpoint(ckpt_dir, tag, model, opt, sched, epoch, step, val,
+                              cfg, tok_path(cfg), None, stage=3,
+                              core_type=cfg.core.type)
 
     stop = False
     for epoch in range(start_epoch, cfg.stage3.epochs):
-        pbar = tqdm(train_loader, desc=f"stage3[{cfg.core.type}] epoch{epoch}", ncols=110)
+        sampler_epoch([train_loader, val_loader], epoch)
+        pbar = tqdm(train_loader, desc=f"stage3[{cfg.core.type}] epoch{epoch}",
+                    ncols=110, disable=not is_main(rank))
         for batch in pbar:
             out = forward_stage3(model, batch, device, cfg)
             loss = out["recon"] + out["aux"] + cfg.loss.latent_weight * out["align"]
 
             opt.zero_grad(set_to_none=True)
             (loss / cfg.train.grad_accum).backward()
+            # manual grad all-reduce (forward uses module methods, not DDP)
+            sync_gradients(params)
             if cfg.train.grad_clip > 0:
                 # float() immediately (tensor return pins the autograd graph)
                 gnorm = float(torch.nn.utils.clip_grad_norm_(params, cfg.train.grad_clip))
@@ -200,7 +205,7 @@ def train_stage3(cfg: Config, stage1_ckpt: Optional[str] = None,
             sched.step()
             gstep += 1
 
-            if gstep % cfg.train.log_interval == 0:
+            if writer is not None and gstep % cfg.train.log_interval == 0:
                 writer.add_scalar("loss/train", loss.item(), gstep)
                 writer.add_scalar("loss/reconstruction", float(out["recon"]), gstep)
                 writer.add_scalar("loss/aux_encoder", float(out["aux"]), gstep)
@@ -216,25 +221,34 @@ def train_stage3(cfg: Config, stage1_ckpt: Optional[str] = None,
 
             if gstep % cfg.train.val_interval == 0 or gstep == total_steps:
                 vs = validate_stage3(model, val_loader, cfg, device, tok.pad_id)
-                for k, v in vs.items():
-                    writer.add_scalar(f"val/{k}", v, gstep)
-                log.info("val @%d: loss=%.3f recon=%.3f aux=%.3f align=%.3f ppl=%.2f acc=%.3f",
-                         gstep, vs["loss"], vs["recon"], vs["aux"], vs["align"],
-                         vs["ppl"], vs["acc"])
-                save_preview(cfg, model, gen, gstep,
-                             str(Path(cfg.train.samples_dir) / f"stage3_{cfg.core.type}"))
+                n_rank = vs.pop("n", 1.0)
+                vs = average_stats(vs, n_rank)
+                if writer is not None:
+                    for k, v in vs.items():
+                        writer.add_scalar(f"val/{k}", v, gstep)
+                if is_main(rank):
+                    log.info("val @%d: loss=%.3f recon=%.3f aux=%.3f align=%.3f ppl=%.2f acc=%.3f",
+                             gstep, vs["loss"], vs["recon"], vs["aux"], vs["align"],
+                             vs["ppl"], vs["acc"])
+                    save_preview(cfg, model, gen, gstep,
+                                 str(Path(cfg.train.samples_dir) / f"stage3_{cfg.core.type}"))
                 best_new = vs["loss"] < best
                 best = min(best, vs["loss"])
-                save("latest.pt", epoch, gstep, best)
-                if best_new:
-                    save("best.pt", epoch, gstep, best)
-                if cfg.train.save_epoch_checkpoints:
-                    save(f"epoch_{epoch}.pt", epoch, gstep, best)
+                if is_main(rank):  # only rank 0 touches the filesystem
+                    save("latest.pt", epoch, gstep, best)
+                    if best_new:
+                        save("best.pt", epoch, gstep, best)
+                    if cfg.train.save_epoch_checkpoints:
+                        save(f"epoch_{epoch}.pt", epoch, gstep, best)
             if cfg.stage3.max_steps and gstep >= cfg.stage3.max_steps:
                 stop = True
                 break
         if stop:
             break
-    writer.close()
-    log.info("Stage 3 [%s] done. best=%.4f -> %s", cfg.core.type, best, ckpt_dir / "best.pt")
+    if writer is not None:
+        writer.close()
+    if is_main(rank):
+        log.info("Stage 3 [%s] done. best=%.4f -> %s", cfg.core.type, best,
+                 ckpt_dir / "best.pt")
+    cleanup_distributed()
     return str(ckpt_dir / "best.pt")

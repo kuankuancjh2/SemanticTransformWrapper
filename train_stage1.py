@@ -32,10 +32,14 @@ def main() -> None:
                     help="disable the VAE (deterministic AE)")
     ap.add_argument("--beta", type=float, default=None,
                     help="KL weight when the VAE is enabled")
+    ap.add_argument("--data", default=None,
+                    help="train directly from an external .jsonl/.json file (messages or prompt/target format); see data/example_toy.jsonl")
     ap.add_argument("--offline", action="store_true")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    if args.data:
+        cfg.train.data_path = args.data
     if args.device:
         cfg.train.device = args.device
     if args.batch_size:
