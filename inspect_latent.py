@@ -60,7 +60,9 @@ def main() -> None:
     else:
         model, cfg, tok = build_stage1_from_checkpoint(ckpt, device)
 
-    convos = load_messages(Path(cfg.data.processed_dir) / "val.jsonl")
+    from src.dataset import LazyMessages
+    _lm = LazyMessages(Path(cfg.data.processed_dir) / "val.jsonl")
+    convos = [_lm[i] for i in range(min(256, len(_lm)))]
     triples = [(format_conversation(c["messages"]),
                 next((m["content"] for m in reversed(c["messages"])
                       if m["role"] == "assistant"), ""), "conv")

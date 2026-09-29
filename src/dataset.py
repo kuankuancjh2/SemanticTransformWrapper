@@ -19,12 +19,70 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 
 Triple = Tuple[str, str, str]  # (prompt, target, ptype) -- stage 1
+
+
+# ----------------------------------------------------------------- lazy IO
+# Disk-backed datasets: keep ONLY a byte-offset index in RAM and read one
+# line per __getitem__ (seek + readline). Never materializes the corpus.
+class LazyJsonl:
+    """Byte-offset index over a .jsonl file; O(#lines) RAM, disk-backed reads.
+
+    File handles are opened lazily per worker process (the object must stay
+    picklable for DataLoader spawn/fork)."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        offsets: List[int] = []
+        with open(self.path, "rb") as f:
+            off = 0
+            for line in f:
+                offsets.append(off)
+                off += len(line)
+        self.offsets = np.asarray(offsets, dtype=np.int64)
+        self._f = None
+
+    def __len__(self) -> int:
+        return len(self.offsets)
+
+    def raw(self, i: int) -> str:
+        if self._f is None:
+            self._f = open(self.path, "rb")
+        self._f.seek(int(self.offsets[i]))
+        return self._f.readline().decode("utf-8")
+
+
+class LazyMessages:
+    """Disk-backed conversations (standard messages format)."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.src = LazyJsonl(path)
+
+    def __len__(self) -> int:
+        return len(self.src)
+
+    def __getitem__(self, i: int) -> Dict:
+        return json.loads(self.src.raw(i))
+
+
+class LazyPairs:
+    """Disk-backed stage-1 (prompt, target, ptype) triples."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.src = LazyJsonl(path)
+
+    def __len__(self) -> int:
+        return len(self.src)
+
+    def __getitem__(self, i: int) -> Triple:
+        d = json.loads(self.src.raw(i))
+        return (d["prompt"], d["target"], d.get("ptype", "cont"))
 
 
 # ------------------------------------------------------------------ formatting
@@ -38,8 +96,11 @@ def format_conversation(messages: Sequence[Dict[str, str]]) -> str:
 
 # ------------------------------------------------------------------ stage 1
 class TextPairDataset(Dataset):
-    def __init__(self, triples: Sequence[Triple], tokenizer, max_seq_len: int) -> None:
-        self.triples: List[Triple] = list(triples)
+    """Stage-1 single-turn pairs. Accepts a materialized list OR a lazy
+    (LazyPairs) source -- the latter never loads the file into RAM."""
+
+    def __init__(self, triples, tokenizer, max_seq_len: int) -> None:
+        self.triples = triples  # keep as-is: may be lazy/disk-backed
         self.tok = tokenizer
         self.max_seq_len = max_seq_len
 
@@ -81,8 +142,11 @@ def collate_pairs(batch: List[dict], pad_id: int) -> dict:
 
 # ------------------------------------------------------------------ stage 2/3
 class MessagesDataset(Dataset):
-    def __init__(self, conversations: Sequence[Dict], tokenizer, max_seq_len: int) -> None:
-        self.convos = list(conversations)
+    """Stage-2/3 conversations. Accepts a list OR a lazy (LazyMessages)
+    disk-backed source."""
+
+    def __init__(self, conversations, tokenizer, max_seq_len: int) -> None:
+        self.convos = conversations  # keep as-is: may be lazy/disk-backed
         self.tok = tokenizer
         self.max_seq_len = max_seq_len
 
@@ -185,3 +249,48 @@ def load_messages(path: str | Path) -> List[Dict]:
 def utterances_of(convos: Sequence[Dict]) -> List[str]:
     """Flatten conversations into individual utterances (stage-1-style text)."""
     return [m["content"] for c in convos for m in c["messages"]]
+
+class LazyTokbinPairs(Dataset):
+    """Stage-1 pairs from the pre-tokenized .tokbin/.tokidx store (np.memmap).
+
+    RAM cost: O(#pairs) int64 offsets + uint8 ptypes -- the token stream
+    itself is memory-mapped, never materialized. Pair i = sequences (2i, 2i+1)
+    in the bin; ptype id 0=ae, 1=para."""
+
+    def __init__(self, base: Path, max_len: int | None = None,
+                 eos_id: int | None = None) -> None:
+        # max_len: hard clamp to the training config's max_seq_len (the tokbin
+        # may have been produced with a larger limit; positional embeddings
+        # are bounded, so over-length sequences must be truncated here)
+        self.max_len = max_len
+        self.eos_id = eos_id
+        binp = Path(str(base) + ".tokbin")
+        idxp = Path(str(base) + ".tokidx.npy")  # np.save appends .npy
+        if not idxp.exists():
+            alt = Path(str(base) + ".tokidx")
+            if alt.exists():
+                idxp = alt
+        ptp = Path(str(base) + ".ptypes.npy")
+        self.idx = np.load(idxp)
+        nbytes = binp.stat().st_size
+        dtype = np.uint16 if nbytes == int(self.idx[-1]) * 2 else np.uint32
+        self.bin = np.memmap(binp, dtype=dtype, mode="r")
+        self.ptypes = np.load(ptp) if ptp.exists() else None
+
+    def __len__(self) -> int:
+        return (len(self.idx) - 1) // 2
+
+    def __getitem__(self, i: int) -> Dict[str, torch.Tensor]:
+        s, m, e = int(self.idx[2 * i]), int(self.idx[2 * i + 1]), int(self.idx[2 * i + 2])
+        p = torch.from_numpy(self.bin[s:m].astype(np.int64))
+        t = torch.from_numpy(self.bin[m:e].astype(np.int64))
+        if self.max_len is not None:
+            for x in (p, t):
+                if len(x) > self.max_len:
+                    cut = x[: self.max_len - 1]
+                    if self.eos_id is not None:
+                        cut[-1] = self.eos_id
+                    x.set_(cut)
+        pid = int(self.ptypes[i]) if self.ptypes is not None else 0
+        return {"prompt_ids": p, "target_ids": t,
+                "ptype": "para" if pid == 1 else "ae"}

@@ -13,7 +13,8 @@ from .layers import TokenEmbedding
 
 class LanguageEncoder(nn.Module):
     def __init__(self, vocab_size: int, d_model: int, num_heads: int, num_layers: int,
-                 ffn_dim: int, max_seq_len: int, dropout: float, pad_id: int) -> None:
+                 ffn_dim: int, max_seq_len: int, dropout: float, pad_id: int,
+                 grad_checkpoint: bool = False) -> None:
         super().__init__()
         self.embed = TokenEmbedding(vocab_size, d_model, max_seq_len, dropout, pad_id)
         layer = nn.TransformerEncoderLayer(
@@ -27,6 +28,14 @@ class LanguageEncoder(nn.Module):
         )
         self.final_norm = nn.LayerNorm(d_model)
         self.d_model = d_model
+        self.grad_checkpoint = grad_checkpoint
+
+    def _layer(self, layer, x, key_padding):
+        if self.grad_checkpoint and self.training:
+            import torch.utils.checkpoint as cp
+            return cp.checkpoint(layer, x, src_key_padding_mask=key_padding,
+                                 use_reentrant=False)
+        return layer(x, src_key_padding_mask=key_padding)
 
     def forward(self, ids: torch.Tensor, padding_mask: Optional[torch.Tensor] = None,
                 return_all_layers: bool = False):
@@ -41,7 +50,7 @@ class LanguageEncoder(nn.Module):
         key_padding = ~padding_mask if padding_mask is not None else None
         all_layers: List[torch.Tensor] = []
         for layer in self.layers:
-            x = layer(x, src_key_padding_mask=key_padding)
+            x = self._layer(layer, x, key_padding)
             all_layers.append(x)
         out = self.final_norm(x)
         if return_all_layers:

@@ -42,6 +42,9 @@ class ModelConfig:
     # encoder states. Default must remain False (main experiment).
     decoder_sees_prompt: bool = False
     tie_embeddings: bool = True
+    # activation checkpointing on encoder/decoder layers (trades ~30% speed
+    # for large activation-memory savings); default off
+    grad_checkpoint: bool = False
 
 
 @dataclass
@@ -158,6 +161,10 @@ class DataConfig:
     hf_dataset: Optional[str] = None
     tokenizer_type: str = "char"  # char | bpe (bpe requires `tokenizers`)
     bpe_vocab_size: int = 4000
+    # ---- memory guards (v4)
+    max_conversations: Optional[int] = 200000  # HF streaming cap (None = no limit)
+    tokenizer_sample_texts: int = 20000        # texts used to train the tokenizer
+    stream_buffer_mb: Optional[int] = None     # flush buffer; None = auto from free RAM
 
 
 @dataclass
@@ -189,6 +196,9 @@ class TrainConfig:
     # pinned host memory: auto (CUDA only) | on | off. "off" avoids pinned-RAM
     # pressure on small Windows machines.
     pin_memory: str = "auto"
+    # cap batch_size by free GPU memory (activation proxy); CPU unaffected
+    auto_batch: bool = True
+    mem_safety_fraction: float = 0.8  # share of *available* RAM/VRAM we may touch
     log_dir: str = "logs"
     checkpoint_dir: str = "checkpoints"
     samples_dir: str = "samples"

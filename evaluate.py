@@ -70,7 +70,9 @@ def main() -> None:
     report["semantic_tests"] = run_semantic_tests(model, tok, device, spec=spec)
 
     # ---- latent statistics (over conversation targets)
-    convos = load_messages(Path(cfg.data.processed_dir) / "val.jsonl")
+    from src.dataset import LazyMessages
+    _lm = LazyMessages(Path(cfg.data.processed_dir) / "val.jsonl")
+    convos = [_lm[i] for i in range(min(256, len(_lm)))]
     triples = conversations_to_triples(convos)
     zs = []
     for _p, t, _pt in triples[:256]:

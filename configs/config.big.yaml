@@ -1,13 +1,13 @@
 model:
   vocab_size: 50
-  max_seq_len: 256
-  hidden_dim: 512
-  num_heads: 8
-  encoder_layers: 4
-  decoder_layers: 8
-  ffn_dim: 2048
+  max_seq_len: 64
+  hidden_dim: 64
+  num_heads: 4
+  encoder_layers: 2
+  decoder_layers: 3
+  ffn_dim: 128
   dropout: 0.1
-  num_semantic_tokens: 32
+  num_semantic_tokens: 8
   encoder_layer_split: null
   decoder_sees_prompt: false
   tie_embeddings: true
@@ -17,30 +17,30 @@ bottleneck:
   use_noise_train: true
   use_queries: true
 core:
-  type: bihopfield
-  num_layers: 8
-  num_heads: 8
-  ffn_dim: 2048
+  type: transformer
+  num_layers: 2
+  num_heads: 4
+  ffn_dim: 128
   dropout: 0.1
-  mlp_hidden: 2048
-  mlp_depth: 8
+  mlp_hidden: 128
+  mlp_depth: 2
   mlp_activation: gelu
   conv_kernel: 3
-  conv_dilation: 1
-  ssm_d_state: 16
+  conv_dilation: 2
+  ssm_d_state: 8
   ssm_d_conv: 4
   ssm_expand: 2.0
   hopfield_beta: 1.0
-  hopfield_steps: 20
+  hopfield_steps: 3
   bi_detach_state: true
-  diffusion_steps: 4
+  diffusion_steps: 3
   diffusion_schedule: cosine
   diffusion_conditioned: false
   seed: 1234
 vae:
-  enabled: true
-  beta: 0.01
-  kl_warmup_steps: 200
+  enabled: false
+  beta: 0.02
+  kl_warmup_steps: 20
   free_bits: 0.05
   logvar_clamp: 10.0
   active_unit_threshold: 0.01
@@ -57,54 +57,54 @@ data:
   processed_dir: data/processed
   cache_dir: data/cache
   metadata_path: data/metadata.json
-  max_seq_len: 256
-  val_split: 0.04
-  test_split: 0.04
+  max_seq_len: 64
+  val_split: 0.1
+  test_split: 0.1
   seed: 42
-  hf_dataset: Jaren/T5-dialogue-pretrain-data
+  hf_dataset: file:data/raw/big_dump.jsonl
   tokenizer_type: char
-  bpe_vocab_size: 16000
+  bpe_vocab_size: 4000
   max_conversations: 200000
   tokenizer_sample_texts: 20000
   stream_buffer_mb: null
 train:
-  device: auto
-  batch_size: 32
-  lr: 0.0003
+  device: cpu
+  batch_size: 16
+  lr: 0.0005
   weight_decay: 0.01
   epochs: 50
   max_steps: null
-  warmup_steps: 500
-  grad_accum: 4
+  warmup_steps: 10
+  grad_accum: 1
   grad_clip: 1.0
-  val_interval: 1000
+  val_interval: 20
   patience: null
   amp: auto
   num_workers: 0
   seed: 3407
   data_path: null
   compress_checkpoints: true
-  save_epoch_checkpoints: true
-  pin_memory: auto
+  save_epoch_checkpoints: false
+  pin_memory: 'off'
   auto_batch: true
   mem_safety_fraction: 0.8
-  log_dir: logs
-  checkpoint_dir: checkpoints
-  samples_dir: samples
-  log_interval: 50
+  log_dir: logs_smoke
+  checkpoint_dir: checkpoints_smoke
+  samples_dir: samples_smoke
+  log_interval: 10
   preview_prompts:
-  - The weather today is good, I want to go hiking.
-  - Alice picked up the book and asked me to read it aloud.
-  - Is the most important thing about AI its ability to understand natural language?
-  - A book dropped from the table.
-  - I like music beacause it makes me feel happy and relaxed.
+  - 今天天气很好，我决定
+  - 小明拿起苹果，然后
+  - 人工智能最重要的问题之一是
+  - 如果一个物体从桌子上掉下来，那么
+  - 我喜欢音乐，因为
 stage3:
   lr: 0.0001
   epochs: 10
   max_steps: null
   warmup_steps: 200
 gen:
-  max_gen_len: 2048
+  max_gen_len: 24
   temperature: 0.7
   top_p: 0.9
   greedy: true

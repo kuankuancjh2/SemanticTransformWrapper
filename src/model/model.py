@@ -30,7 +30,8 @@ class Stage1Model(nn.Module):
         self.cfg = cfg
         self.encoder = LanguageEncoder(
             m.vocab_size, m.hidden_dim, m.num_heads, m.encoder_layers,
-            m.ffn_dim, m.max_seq_len, m.dropout, pad_id=0)
+            m.ffn_dim, m.max_seq_len, m.dropout, pad_id=0,
+            grad_checkpoint=m.grad_checkpoint)
         self.bottleneck = SemanticBottleneck(
             m.hidden_dim, m.num_heads, m.num_semantic_tokens, m.dropout,
             noise_std=cfg.bottleneck.noise_std,
@@ -40,7 +41,8 @@ class Stage1Model(nn.Module):
         self.decoder = LanguageDecoder(
             m.vocab_size, m.hidden_dim, m.num_heads, m.decoder_layers,
             m.ffn_dim, m.max_seq_len, m.dropout, pad_id=0,
-            decoder_sees_prompt=m.decoder_sees_prompt)
+            decoder_sees_prompt=m.decoder_sees_prompt,
+            grad_checkpoint=m.grad_checkpoint)
 
     # ------------------------------------------------------------- encoding
     def encode(self, ids: torch.Tensor, padding_mask: Optional[torch.Tensor] = None,

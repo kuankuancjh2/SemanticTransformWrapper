@@ -69,6 +69,8 @@ data:
   seed: 42
   hf_dataset: null
   tokenizer_type: char
+  max_conversations: 200000 # streaming cap for HF ingestion (null = unlimited)
+  tokenizer_sample_texts: 20000 # texts sampled for tokenizer training
   bpe_vocab_size: 4000
 train:
   device: cpu

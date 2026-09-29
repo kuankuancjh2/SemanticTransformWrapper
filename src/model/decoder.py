@@ -22,7 +22,8 @@ def causal_mask(t: int, device: torch.device) -> torch.Tensor:
 class LanguageDecoder(nn.Module):
     def __init__(self, vocab_size: int, d_model: int, num_heads: int, num_layers: int,
                  ffn_dim: int, max_seq_len: int, dropout: float, pad_id: int,
-                 decoder_sees_prompt: bool = False) -> None:
+                 decoder_sees_prompt: bool = False,
+                 grad_checkpoint: bool = False) -> None:
         super().__init__()
         self.embed = TokenEmbedding(vocab_size, d_model, max_seq_len, dropout, pad_id)
         self.blocks = nn.ModuleList([
@@ -33,6 +34,7 @@ class LanguageDecoder(nn.Module):
         self.head = nn.Linear(d_model, vocab_size, bias=False)
         self.pad_id = pad_id
         self.sees_prompt = decoder_sees_prompt
+        self.grad_checkpoint = grad_checkpoint
 
     def forward(self, tgt_ids: torch.Tensor, semantic_tokens: torch.Tensor,
                 tgt_padding_mask: Optional[torch.Tensor] = None,
@@ -50,8 +52,13 @@ class LanguageDecoder(nn.Module):
         tkey = ~tgt_padding_mask if tgt_padding_mask is not None else None
         pkey = ~prompt_padding_mask if prompt_padding_mask is not None else None
         for blk in self.blocks:
-            x = blk(x, semantic_tokens, cmask, tkey,
-                    prompt_states, pkey, all_layers=all_layers)
+            if self.grad_checkpoint and self.training and x.requires_grad is not None:
+                import torch.utils.checkpoint as cp
+                x = cp.checkpoint(blk, x, semantic_tokens, cmask, tkey,
+                                  prompt_states, pkey, use_reentrant=False)
+            else:
+                x = blk(x, semantic_tokens, cmask, tkey,
+                        prompt_states, pkey, all_layers=all_layers)
         x = self.final_norm(x)
         return self.head(x)
 

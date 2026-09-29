@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from ..config import Config
+from ..memutils import effective_batch_size
 from ..generation import Generator
 from ..utils.logging_utils import get_logger
 
@@ -126,11 +127,22 @@ def _build_loaders(tr_ds, va_ds, collate, cfg: Config, ddp: bool
     if ddp:
         import torch.distributed as _d
         world = _d.get_world_size()
+    # auto_batch: cap the batch by ACTUALLY free GPU memory (activation proxy),
+    # divided across DDP ranks; never grows the configured batch, CPU no-op
+    bs = cfg.train.batch_size
+    if getattr(cfg.train, "auto_batch", True):
+        capped = effective_batch_size(cfg.train.batch_size, cfg.data.max_seq_len,
+                                      cfg.model.hidden_dim,
+                                      cfg.train.mem_safety_fraction,
+                                      world if ddp else 1)
+        if capped < bs:
+            log.info("auto_batch: %d -> %d (free-VRAM cap, world=%d)", bs, capped, world)
+            bs = capped
     per_rank = (len(tr_ds) + world - 1) // world
     # tiny external datasets: never let batch_size exceed the per-rank split,
     # and never drop the only (partial) batch -- drop_last=True with 0 full
     # batches would silently skip ALL training
-    bs = max(1, min(cfg.train.batch_size, per_rank))
+    bs = max(1, min(bs, per_rank))
     drop_last = per_rank >= bs
     if ddp:
         from torch.utils.data.distributed import DistributedSampler
@@ -167,9 +179,11 @@ def make_loaders(cfg: Config, tok, stage: int, ddp: bool = False
             f"data.max_seq_len ({cfg.data.max_seq_len}) exceeds model.max_seq_len "
             f"({cfg.model.max_seq_len}) -- positional embeddings would overflow. "
             "Keep the two keys equal (all shipped configs do).")
-    from ..dataset import (MessagesDataset, TextPairDataset, collate_messages,
+    from ..dataset import (LazyMessages, LazyPairs, LazyTokbinPairs,
+                           MessagesDataset, TextPairDataset, collate_messages,
                            collate_pairs, load_messages, load_pairs,
                            utterances_of)
+    from ..memutils import effective_batch_size
 
     if cfg.train.data_path:  # ---- external data mode
         convos = load_external_items(cfg.train.data_path)
@@ -199,16 +213,26 @@ def make_loaders(cfg: Config, tok, stage: int, ddp: bool = False
     base = Path(cfg.data.processed_dir)
     pad = tok.pad_id
     if stage == 1:
-        tr = load_pairs(base / "stage1_train.jsonl")
-        va = load_pairs(base / "stage1_val.jsonl")
-        tr_ds = TextPairDataset(tr, tok, cfg.data.max_seq_len)
-        va_ds = TextPairDataset(va, tok, cfg.data.max_seq_len)
+        # fast path: pre-tokenized memmap pairs (no text in RAM, no re-tokenize)
+        if (base / "stage1_train.tokbin").exists():
+            tr_ds = LazyTokbinPairs(base / "stage1_train",
+                                    max_len=cfg.data.max_seq_len, eos_id=tok.eos_id)
+        else:
+            tr_ds = TextPairDataset(LazyPairs(base / "stage1_train.jsonl"), tok,
+                                    cfg.data.max_seq_len)
+        if (base / "stage1_val.tokbin").exists():
+            va_ds = LazyTokbinPairs(base / "stage1_val",
+                                    max_len=cfg.data.max_seq_len, eos_id=tok.eos_id)
+        else:
+            va_ds = TextPairDataset(LazyPairs(base / "stage1_val.jsonl"), tok,
+                                    cfg.data.max_seq_len)
         tl, vl = _build_loaders(tr_ds, va_ds, lambda b: collate_pairs(b, pad), cfg, ddp)
     else:
-        tr = load_messages(base / "train.jsonl")
-        va = load_messages(base / "val.jsonl")
-        tr_ds = MessagesDataset(tr, tok, cfg.data.max_seq_len)
-        va_ds = MessagesDataset(va, tok, cfg.data.max_seq_len)
+        # disk-backed lazy conversations: one line per __getitem__
+        tr_ds = MessagesDataset(LazyMessages(base / "train.jsonl"), tok,
+                                cfg.data.max_seq_len)
+        va_ds = MessagesDataset(LazyMessages(base / "val.jsonl"), tok,
+                                cfg.data.max_seq_len)
         tl, vl = _build_loaders(tr_ds, va_ds, lambda b: collate_messages(b, pad), cfg, ddp)
     meta = {}
     mp = Path(cfg.data.metadata_path)

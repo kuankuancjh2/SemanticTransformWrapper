@@ -149,3 +149,24 @@ train:
   data_path: null             # 等效 --data；非 null 时跳过 processed splits
   compress_checkpoints: true  # 除 best.pt 外全部 gzip
 ```
+
+## 内存策略（v4）
+
+数据全程**磁盘流式**，任何阶段都不整体装入内存：
+
+- `prepare_data.py`：HF 数据集用 `streaming=True` 逐条读取（`data.max_conversations`
+  封顶），逐行解析你的多格式逻辑后经 **flush buffer** 写盘；tokenizer 只在
+  `tokenizer_sample_texts` 条样本上训练。flush buffer 与所有写缓冲按
+  **实际可用内存**（psutil / `MemAvailable`）× `train.mem_safety_fraction`
+  × 5% 份额取值——小内存机器自动变小，永远不超预算。本地大文件也能流式重切：
+  `data.hf_dataset: "file:data/raw/your_dump.jsonl"`（不联网）。
+- 训练 Dataset 全部**惰性磁盘读取**：Stage 1 优先读预分词的
+  `stage1_*.tokbin/tokidx`（`np.memmap`，进程间共享页缓存，零文本驻留；
+  训练时不再重复分词）；Stage 2/3 的对话是 byte-offset 索引 + 每条
+  `seek+read`。validation 只读前 256 条。
+- `train.auto_batch: true`：按 `torch.cuda.mem_get_info()` 的**实际空闲显存**
+  钳制 batch（激活代理 T·D·4B·24，再除以 DDP world），只减不增，CPU 不受影响。
+- `model.grad_checkpoint: true`（可选）：encoder/decoder 层激活检查点，
+  以约 30% 速度换大幅激活显存节省。
+- 实测（同机同数据）：旧式整体装载 400k 对话 ≈ 1.2 GB+ 峰值；流式 prepare
+  全程 ≈ torch 解释器基线（约 240 MB），与文件大小无关。
