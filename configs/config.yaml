@@ -18,7 +18,7 @@ bottleneck:
   use_queries: true
 core:
   type: bihopfield
-  num_layers: 8
+  num_layers: 6
   num_heads: 8
   ffn_dim: 2048
   dropout: 0.1
@@ -31,7 +31,7 @@ core:
   ssm_d_conv: 4
   ssm_expand: 2.0
   hopfield_beta: 1.0
-  hopfield_steps: 20
+  hopfield_steps: 12
   bi_detach_state: true
   diffusion_steps: 4
   diffusion_schedule: cosine
@@ -69,7 +69,7 @@ data:
   stream_buffer_mb: null
 train:
   device: auto
-  batch_size: 32
+  batch_size: 128
   lr: 0.0003
   weight_decay: 0.01
   epochs: 50
